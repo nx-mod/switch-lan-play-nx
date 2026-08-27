@@ -1,0 +1,1764 @@
+#include "bsd_bridge_service.hpp"
+#include "../cfg/runtime_cfg.hpp"
+#include <arpa/inet.h>
+#include <poll.h>
+#include <array>
+
+// libnx C services used by the lazy socket stack below (same pattern as
+// ldn_mitm's own ldnmitm_main.cpp).
+extern "C" {
+#include <switch/services/bsd.h>
+#include <switch/services/nifm.h>
+}
+
+/*
+ * bsd_bridge_service.cpp
+ *
+ * Generic commands are forwarded to the real bsd:u service byte-for-byte
+ * via raw libnx HIPC dispatch (serviceMitmDispatch*) against
+ * m_forward_service -- ldn_mitm never notices it's being mitm'd for these.
+ * Only Bind/SendTo/RecvFrom/Close have real logic, and only for the one
+ * socket bridged to the relay (see header).
+ */
+namespace ams::mitm::bsd {
+
+    namespace {
+        slp::RelayBridge g_relay;
+        bool g_relay_connect_attempted = false;
+        // Explicit on/off switch for the overlay's Start/Stop buttons --
+        // EnsureRelayConnected() refuses to (re)connect while this is false.
+        // Independent of g_relay.IsConnected(): being "enabled" just means
+        // allowed to connect, not that it currently IS connected.
+        bool g_relay_enabled = true;
+        // Mirrors the active BsdBridgeService instance's own m_bridged_local_ip
+        // (per-instance, not otherwise reachable from the static ConfigService
+        // accessors) so the overlay can show what virtual/local address this
+        // console is presenting as. 0 = no bridged session active right now.
+        u32 g_last_bridged_local_ip = 0;
+
+        // Guards g_relay/g_relay_connect_attempted/g_socket_stack_ready/
+        // g_relay_enabled/g_last_bridged_local_ip.
+        // Added alongside slpnx:cfg's Reconnect command (cfg/cfg_service.cpp):
+        // before that, EnsureRelayConnected() was only ever called from the
+        // single mitm dispatch thread (mitm::TotalThreads == 1, main.cpp), so
+        // these globals were touched from one thread only. Reconnect can now
+        // call ForceReconnect() from the SEPARATE cfg server thread while the
+        // mitm thread is concurrently mid-EnsureRelayConnected/SendTo/RecvFrom
+        // -- without this, Close() racing a live Connect()/SendIpv4() on
+        // g_relay's socket is a real use-after-close.
+        ams::os::SdkMutex g_relay_mutex;
+
+        // Watchdog: a game can force-close without calling ldn:u's own
+        // Finalize()/CloseAccessPoint()/DestroyNetwork(), leaving the
+        // underlying session alive indefinitely -- the normal teardown path
+        // (Close()-triggers-g_relay.Close(), above) never fires for that
+        // case, and we can't hook ldn:u's own teardown since we only ever
+        // touch ldn_mitm's bsd:u calls. Independent safety net instead: if
+        // the relay has been "connected" for a long time with NO real
+        // bridged traffic at all, something is very likely orphaned (a real
+        // active LDN session generates control traffic continuously), so
+        // drop it and let the next real usage reconnect fresh rather than
+        // staying wedged until a reboot.
+        std::atomic<u64> g_last_bridge_activity_ms{0};
+        constexpr u64 WatchdogIdleTimeoutMs = 10 * 60 * 1000; // 10 minutes
+        bool g_watchdog_started = false;
+
+        void TouchBridgeActivity() {
+            g_last_bridge_activity_ms.store(
+                ams::os::ConvertToTimeSpan(ams::os::GetSystemTick()).GetMilliSeconds(),
+                std::memory_order_relaxed);
+        }
+
+        void WatchdogThreadMain(void *) {
+            while (true) {
+                ams::os::SleepThread(ams::TimeSpan::FromSeconds(60));
+                std::scoped_lock lk(g_relay_mutex);
+                if (!g_relay.IsConnected()) continue;
+                u64 last = g_last_bridge_activity_ms.load(std::memory_order_relaxed);
+                if (last == 0) continue; // no bridged traffic has ever flowed yet -- nothing to judge staleness against
+                u64 now = ams::os::ConvertToTimeSpan(ams::os::GetSystemTick()).GetMilliSeconds();
+                if (now - last < WatchdogIdleTimeoutMs) continue;
+                LogFormat("BsdBridge: watchdog -- relay idle %llu ms with no bridged traffic, "
+                    "closing (likely an orphaned session -- next real use reconnects fresh)",
+                    static_cast<unsigned long long>(now - last));
+                g_relay.Close();
+                g_relay_connect_attempted = false;
+                g_last_bridged_local_ip = 0;
+                g_last_bridge_activity_ms.store(0, std::memory_order_relaxed);
+            }
+        }
+
+        constexpr size_t WatchdogStackSize = 0x2000;
+        alignas(ams::os::MemoryPageSize) u8 g_watchdog_stack[WatchdogStackSize];
+        ams::os::ThreadType g_watchdog_thread;
+
+        void EnsureWatchdogStarted() {
+            if (g_watchdog_started) return;
+            g_watchdog_started = true;
+            Result rc = ams::os::CreateThread(std::addressof(g_watchdog_thread), WatchdogThreadMain, nullptr,
+                g_watchdog_stack, sizeof(g_watchdog_stack), 20);
+            if (R_FAILED(rc)) return;
+            ams::os::SetThreadNamePointer(std::addressof(g_watchdog_thread), "BsdBridge::Watchdog");
+            ams::os::StartThread(std::addressof(g_watchdog_thread));
+        }
+
+        // Host/port come from slpnx::cfg::RuntimeCfg (cfg/runtime_cfg.hpp),
+        // persisted on SD and editable at runtime from the switch-lan-play-nx
+        // Tesla overlay. Falls back to a default relay if nothing is
+        // configured yet (see RuntimeCfg::GetSelectedHostPort's own default).
+
+        // ---- lazy socket stack ----------------------------------------------
+        // Deferred rather than initialized in main.cpp's InitializeSystemModule:
+        // this process still needs its OWN real bsd:u session for the relay
+        // UDP socket in relay_bridge.hpp, but initializing nifm/bsd/socket
+        // before registering the mitm would race ldn_mitm's own
+        // bsdInitialize(). Only needed once traffic actually flows, well
+        // after RegisterMitmServer has won the mitm-registration race.
+        bool g_socket_stack_ready = false;
+
+        consteval size_t GetLibnxBsdTransferMemorySize(const ::SocketInitConfig *config) {
+            const u32 tcp_tx_buf_max_size = config->tcp_tx_buf_max_size != 0 ? config->tcp_tx_buf_max_size : config->tcp_tx_buf_size;
+            const u32 tcp_rx_buf_max_size = config->tcp_rx_buf_max_size != 0 ? config->tcp_rx_buf_max_size : config->tcp_rx_buf_size;
+            const u32 sum = tcp_tx_buf_max_size + tcp_rx_buf_max_size + config->udp_tx_buf_size + config->udp_rx_buf_size;
+            return config->sb_efficiency * util::AlignUp(sum, os::MemoryPageSize);
+        }
+
+        constexpr const ::SocketInitConfig LibnxSocketInitConfig = {
+            .tcp_tx_buf_size = 0x800,
+            .tcp_rx_buf_size = 0x1000,
+            .tcp_tx_buf_max_size = 0x2000,
+            .tcp_rx_buf_max_size = 0x2000,
+            .udp_tx_buf_size = 0x2000,
+            .udp_rx_buf_size = 0x2000,
+            .sb_efficiency = 4,
+            .num_bsd_sessions = 3,
+            .bsd_service_type = BsdServiceType_User,
+        };
+
+        alignas(os::MemoryPageSize) constinit u8 g_socket_tmem_buffer[GetLibnxBsdTransferMemorySize(std::addressof(LibnxSocketInitConfig))];
+
+        constexpr const ::BsdInitConfig LibnxBsdInitConfig = {
+            .version             = 1,
+            .tmem_buffer         = g_socket_tmem_buffer,
+            .tmem_buffer_size    = sizeof(g_socket_tmem_buffer),
+            .tcp_tx_buf_size     = LibnxSocketInitConfig.tcp_tx_buf_size,
+            .tcp_rx_buf_size     = LibnxSocketInitConfig.tcp_rx_buf_size,
+            .tcp_tx_buf_max_size = LibnxSocketInitConfig.tcp_tx_buf_max_size,
+            .tcp_rx_buf_max_size = LibnxSocketInitConfig.tcp_rx_buf_max_size,
+            .udp_tx_buf_size     = LibnxSocketInitConfig.udp_tx_buf_size,
+            .udp_rx_buf_size     = LibnxSocketInitConfig.udp_rx_buf_size,
+            .sb_efficiency       = LibnxSocketInitConfig.sb_efficiency,
+        };
+
+        void EnsureSocketStack() {
+            if (g_socket_stack_ready) return;
+            Result rc = nifmInitialize(NifmServiceType_Admin);
+            LogFormat("BsdBridge: lazy nifmInitialize -> %s", R_SUCCEEDED(rc) ? "ok" : "FAILED (continuing)");
+            rc = bsdInitialize(&LibnxBsdInitConfig, LibnxSocketInitConfig.num_bsd_sessions, LibnxSocketInitConfig.bsd_service_type);
+            if (R_FAILED(rc)) { LogFormat("BsdBridge: lazy bsdInitialize FAILED"); return; }
+            rc = socketInitialize(&LibnxSocketInitConfig);
+            if (R_FAILED(rc)) { LogFormat("BsdBridge: lazy socketInitialize FAILED"); return; }
+            g_socket_stack_ready = true;
+            // Runtime reference keeps g_socket_tmem_buffer odr-used (its only
+            // other mention is constexpr-evaluated away, which trips
+            // -Werror=unused-variable).
+            LogFormat("BsdBridge: lazy socket stack ready (tmem %p %zu)",
+                static_cast<void *>(g_socket_tmem_buffer), sizeof(g_socket_tmem_buffer));
+        }
+
+        // ---- fd type tracking ----------------------------------------------
+        // Bind alone can't tell SOCK_DGRAM from SOCK_STREAM, and ldn_mitm
+        // binds BOTH its UDP control socket and its TCP station listener to
+        // the same DefaultPort 11452 (lan_discovery.cpp initTcp/initUdp).
+        // Bind()'s is_udp check (below) needs this to route each fd to the
+        // right virtualization path.
+        constexpr size_t MaxTrackedFds = 16;
+
+        // Plain C arrays are zero-initialized by C++'s static-storage-duration
+        // rules, not filled with -1 -- both arrays must be seeded explicitly
+        // or "-1 means unused" isn't actually true at startup, and TrackFd's
+        // "find an empty slot" scan never matches anything.
+        constexpr std::array<s32, MaxTrackedFds> MakeUnsetFdArray() {
+            std::array<s32, MaxTrackedFds> a{};
+            for (auto &v : a) { v = -1; }
+            return a;
+        }
+        std::array<s32, MaxTrackedFds> g_tracked_fd = MakeUnsetFdArray();
+        std::array<s32, MaxTrackedFds> g_tracked_type = MakeUnsetFdArray();
+
+        void TrackFd(s32 fd, s32 type) {
+            if (fd < 0) return;
+            for (size_t i = 0; i < MaxTrackedFds; i++) {
+                if (g_tracked_fd[i] == -1 || g_tracked_fd[i] == fd) {
+                    g_tracked_fd[i] = fd;
+                    g_tracked_type[i] = type;
+                    return;
+                }
+            }
+        }
+
+        void UntrackFd(s32 fd) {
+            for (size_t i = 0; i < MaxTrackedFds; i++) {
+                if (g_tracked_fd[i] == fd) g_tracked_fd[i] = -1;
+            }
+        }
+
+        s32 GetTrackedType(s32 fd) {
+            for (size_t i = 0; i < MaxTrackedFds; i++) {
+                if (g_tracked_fd[i] == fd) return g_tracked_type[i];
+            }
+            return -1;
+        }
+
+        // Mirrors BsdBridgeService::LdnControlPort (private class member, not
+        // reachable from these free functions) -- same value, ldn_mitm's own
+        // DefaultPort from lan_discovery.hpp. Both the UDP control channel
+        // AND the TCP station channel use this SAME port number; only the IP
+        // protocol byte tells them apart.
+        constexpr u16 LdnControlPort = 11452;
+
+        // Parses one raw IPv4/UDP packet (as popped from RelayBridge::PopIpv4)
+        // into its source IP, destination port, and payload -- still used for
+        // the control channel only.
+        bool ParseIpv4Udp(const u8 *pkt, size_t pkt_len, u32 &out_src_ip, u16 &out_dst_port,
+                const u8 *&out_payload, size_t &out_payload_len) {
+            if (pkt_len < 28) return false;
+            u8 ihl = (pkt[0] & 0x0F) * 4;
+            if (pkt[9] != 17 || pkt_len < static_cast<size_t>(ihl) + 8) return false; // 17 = IPPROTO_UDP
+            out_src_ip = (static_cast<u32>(pkt[12]) << 24) | (static_cast<u32>(pkt[13]) << 16) |
+                         (static_cast<u32>(pkt[14]) << 8) | static_cast<u32>(pkt[15]);
+            const u8 *udp = pkt + ihl;
+            out_dst_port = static_cast<u16>((udp[2] << 8) | udp[3]);
+            u16 udp_len = static_cast<u16>((udp[4] << 8) | udp[5]);
+            size_t payload_len = (udp_len >= 8) ? (udp_len - 8) : 0;
+            if (static_cast<size_t>(ihl) + udp_len > pkt_len) return false;
+            out_payload = udp + 8;
+            out_payload_len = payload_len;
+            return true;
+        }
+
+        // Small FIFO the control channel (UDP, LdnControlPort) actually reads
+        // from -- DrainRelay is the ONLY caller of GetRelay().PopIpv4(), so
+        // control-channel packets get sorted in here instead of RecvFrom
+        // popping the shared relay queue directly (which would risk handing a
+        // TCP segment to the control-channel parser). Same capacity as
+        // RelayBridge's own QueueSize; LDN control traffic is light so this
+        // is generous headroom, not a tight budget.
+        constexpr size_t ControlQueueSize = 32;
+        struct ControlPacket { size_t len; u8 data[20 + 8 + slp::RELAY_MTU]; };
+        ControlPacket g_control_queue[ControlQueueSize];
+        size_t g_control_head = 0, g_control_count = 0;
+        ams::os::SdkMutex g_control_queue_mutex;
+
+        // ---- real TCP tunnel -------------------------------------------------
+        // Bridges ldn_mitm's OTHER socket: the LDN "station" TCP connection
+        // (lan_discovery.cpp initTcp()) used for the Connect/SyncNetwork join
+        // handshake after ScanResp. Builds and parses genuine TCP segments: a
+        // real 3-way handshake (SYN / SYN-ACK / ACK), real sequence/ack
+        // tracking, real TCP checksums, tunneled via the same
+        // RelayBridge::SendIpv4/PopIpv4 plumbing the UDP control channel uses
+        // (the relay is a dumb raw-packet router keyed on destination IP; it
+        // doesn't care what IP protocol number a packet carries). A real
+        // peer's own ldn_mitm sends genuine raw TCP (protocol 6) on port
+        // 11452 -- the same port the UDP control channel uses, distinguished
+        // only by the IP protocol number -- so this interops with it
+        // directly.
+        //
+        // Confirmed from ldn_mitm's own source (lan_protocol.cpp
+        // TcpLanSocketBase::recvfrom/sendto) that the TCP fd is used with
+        // plain sendto(fd,buf,len,0,nullptr,0)/recvfrom(fd,buf,len,0,nullptr,0)
+        // -- i.e. bsd:u's SendTo/RecvFrom commands, the SAME commands already
+        // handled below for the UDP fd, just with an empty addr.
+        //
+        // Deliberate simplifications vs a full RFC793 stack (acceptable given
+        // LDN's own traffic pattern here -- a handful of small control
+        // messages, not bulk transfer): no retransmission timer or
+        // congestion control on OUR side (a real peer's own TCP stack already
+        // retransmits on its own timeout if we don't ACK in time -- see the
+        // "don't ack if inbox already full" note below); no out-of-order
+        // reassembly (a mismatched seq is just dropped, relying on the peer's
+        // own retransmit); single-slot inbox per connection (matches
+        // ldn_mitm's own send-then-wait-for-exactly-one-reply usage pattern
+        // for this socket).
+        constexpr u8 TCP_FIN = 0x01, TCP_SYN = 0x02, TCP_RST = 0x04, TCP_PSH = 0x08, TCP_ACK = 0x10;
+
+        constexpr size_t VTcpInboxCap = 2048; // one compressed LAN packet is at most LanSocket::BufferSize (2048) in ldn_mitm's own source
+
+        // A connection accepted or in progress -- accepted (host role) gets a
+        // SYNTHETIC fd (see AllocVTcpConn's caller in Accept below); our own
+        // outbound Connect() reuses the REAL fd from its own Socket() call.
+        struct VTcpConn {
+            bool used = false;
+            s32 fd = -1;
+            bool established = false;              // full 3-way handshake done, data may flow
+            bool syn_sent_awaiting_synack = false;  // client role: Connect() sent SYN, waiting
+            u32 peer_ip = 0;                        // host order
+            u16 peer_port = 0;
+            u32 our_isn = 0;   // recorded at SYN time (client role) to validate the SYN-ACK's ack field
+            u32 our_seq = 0;   // next byte WE will send
+            u32 their_seq = 0; // next byte WE expect (the value we put in our own ack field)
+            u8 inbox[VTcpInboxCap];
+            size_t inbox_len = 0;
+            bool inbox_ready = false;
+            bool peer_closed = false;
+        };
+        // 1 client-role connection, or up to StationCountMax(8, ldn_mitm's own
+        // constant) host-role accepted stations -- ldn_mitm only ever plays
+        // ONE role per session, so this covers either case with room to spare.
+        constexpr int MaxVTcpConns = 9;
+        VTcpConn g_vtcp_conns[MaxVTcpConns];
+
+        s32 g_tcp_listen_fd = -1;   // set once ldn_mitm Bind()+Listen()s its TCP
+                                     // socket on LdnControlPort (host role)
+
+        // A SYN has arrived and been SYN-ACKed (both happen immediately in
+        // DrainRelay, matching a real kernel's TCP stack -- accept() only
+        // ever DEQUEUES an already-handshaked connection, it doesn't drive
+        // the handshake itself) but the final client ACK hasn't arrived yet.
+        struct PendingAccept {
+            bool used = false;
+            u32 peer_ip = 0;
+            u16 peer_port = 0;
+            u32 our_isn = 0;
+            u32 their_isn = 0;
+            bool got_final_ack = false; // true once ready for Accept() to dequeue
+        };
+        constexpr int MaxPendingAccepts = 8;
+        PendingAccept g_pending_accepts[MaxPendingAccepts];
+
+        s32 g_next_synthetic_fd = 1000; // real bsd:u fds never reach this high
+                                          // in this narrow use case (a handful
+                                          // of sockets total per ldn_mitm session)
+
+        ams::os::SdkMutex g_vtcp_mutex; // guards everything above
+
+        VTcpConn *FindVTcpConnByFd(s32 fd) {
+            for (auto &c : g_vtcp_conns) { if (c.used && c.fd == fd) return &c; }
+            return nullptr;
+        }
+        // Matches by peer IP alone: ldn_mitm always uses port 11452 for both
+        // sides of this channel, so a peer's IP alone is enough to tell its
+        // one connection apart from every other peer's (host role can have
+        // several stations, one per distinct console/peer IP).
+        VTcpConn *FindVTcpConnByPeer(u32 peer_ip) {
+            for (auto &c : g_vtcp_conns) { if (c.used && c.peer_ip == peer_ip) return &c; }
+            return nullptr;
+        }
+        VTcpConn *AllocVTcpConn() {
+            for (auto &c : g_vtcp_conns) {
+                if (!c.used) {
+                    c = VTcpConn{};
+                    c.used = true;
+                    return &c;
+                }
+            }
+            return nullptr;
+        }
+
+        // Same idea, for a real IPv4/TCP segment.
+        bool ParseIpv4Tcp(const u8 *pkt, size_t pkt_len, u32 &out_src_ip, u16 &out_src_port, u16 &out_dst_port,
+                u32 &out_seq, u32 &out_ack, u8 &out_flags, const u8 *&out_payload, size_t &out_payload_len) {
+            if (pkt_len < 40) return false; // 20 (ip) + 20 (tcp, no options) minimum
+            u8 ihl = (pkt[0] & 0x0F) * 4;
+            if (pkt[9] != 6 || pkt_len < static_cast<size_t>(ihl) + 20) return false; // 6 = IPPROTO_TCP
+            out_src_ip = (static_cast<u32>(pkt[12]) << 24) | (static_cast<u32>(pkt[13]) << 16) |
+                         (static_cast<u32>(pkt[14]) << 8) | static_cast<u32>(pkt[15]);
+            const u8 *tcp = pkt + ihl;
+            out_src_port = static_cast<u16>((tcp[0] << 8) | tcp[1]);
+            out_dst_port = static_cast<u16>((tcp[2] << 8) | tcp[3]);
+            out_seq = (static_cast<u32>(tcp[4]) << 24) | (static_cast<u32>(tcp[5]) << 16) |
+                      (static_cast<u32>(tcp[6]) << 8) | static_cast<u32>(tcp[7]);
+            out_ack = (static_cast<u32>(tcp[8]) << 24) | (static_cast<u32>(tcp[9]) << 16) |
+                      (static_cast<u32>(tcp[10]) << 8) | static_cast<u32>(tcp[11]);
+            size_t data_offset = static_cast<size_t>(tcp[12] >> 4) * 4;
+            out_flags = tcp[13];
+            if (data_offset < 20 || static_cast<size_t>(ihl) + data_offset > pkt_len) return false;
+            out_payload = tcp + data_offset;
+            out_payload_len = pkt_len - ihl - data_offset;
+            return true;
+        }
+
+        // Standard TCP checksum: 16-bit one's-complement sum over the pseudo
+        // header (src ip, dst ip, zero, protocol, tcp length) followed by the
+        // full segment (header + payload), with the segment's own checksum
+        // field taken as zero for the purpose of this calculation.
+        u16 TcpChecksum(u32 src_ip, u32 dst_ip, const u8 *seg, size_t seg_len) {
+            u32 sum = 0;
+            sum += (src_ip >> 16) & 0xFFFF; sum += src_ip & 0xFFFF;
+            sum += (dst_ip >> 16) & 0xFFFF; sum += dst_ip & 0xFFFF;
+            sum += 6; // protocol = TCP
+            sum += static_cast<u32>(seg_len);
+            size_t i = 0;
+            for (; i + 1 < seg_len; i += 2) {
+                sum += (static_cast<u32>(seg[i]) << 8) | seg[i + 1];
+            }
+            if (i < seg_len) {
+                sum += static_cast<u32>(seg[i]) << 8;
+            }
+            while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+            return static_cast<u16>(~sum);
+        }
+
+        // Builds and sends one raw IPv4/TCP segment via the relay.
+        ssize_t SendTcpSegment(u32 src_ip, u32 dst_ip, u16 src_port, u16 dst_port,
+                u32 seq, u32 ack, u8 flags, const void *payload, size_t payload_len) {
+            u8 packet[20 + 20 + slp::RELAY_MTU];
+            size_t tcp_len = 20 + payload_len;
+            size_t total = 20 + tcp_len;
+            if (total > sizeof(packet)) return -1;
+
+            u8 *ip = packet;
+            ip[0] = 0x45; ip[1] = 0x00;
+            ip[2] = static_cast<u8>(total >> 8); ip[3] = static_cast<u8>(total);
+            ip[4] = 0; ip[5] = 0; ip[6] = 0; ip[7] = 0;
+            ip[8] = 64; ip[9] = 6; ip[10] = 0; ip[11] = 0; // protocol = TCP
+            ip[12] = static_cast<u8>(src_ip >> 24); ip[13] = static_cast<u8>(src_ip >> 16);
+            ip[14] = static_cast<u8>(src_ip >> 8);  ip[15] = static_cast<u8>(src_ip);
+            ip[16] = static_cast<u8>(dst_ip >> 24); ip[17] = static_cast<u8>(dst_ip >> 16);
+            ip[18] = static_cast<u8>(dst_ip >> 8);  ip[19] = static_cast<u8>(dst_ip);
+
+            u8 *tcp = packet + 20;
+            tcp[0] = static_cast<u8>(src_port >> 8); tcp[1] = static_cast<u8>(src_port);
+            tcp[2] = static_cast<u8>(dst_port >> 8); tcp[3] = static_cast<u8>(dst_port);
+            tcp[4] = static_cast<u8>(seq >> 24); tcp[5] = static_cast<u8>(seq >> 16);
+            tcp[6] = static_cast<u8>(seq >> 8);  tcp[7] = static_cast<u8>(seq);
+            tcp[8] = static_cast<u8>(ack >> 24); tcp[9] = static_cast<u8>(ack >> 16);
+            tcp[10] = static_cast<u8>(ack >> 8); tcp[11] = static_cast<u8>(ack);
+            tcp[12] = 5 << 4; // data offset = 5 words (20 bytes), no options
+            tcp[13] = flags;
+            tcp[14] = 0x20; tcp[15] = 0x00; // window = 8192, arbitrary reasonable value
+            tcp[16] = 0; tcp[17] = 0;       // checksum placeholder, filled below
+            tcp[18] = 0; tcp[19] = 0;       // urgent pointer, unused
+            if (payload_len > 0) std::memcpy(tcp + 20, payload, payload_len);
+
+            u16 csum = TcpChecksum(src_ip, dst_ip, tcp, tcp_len);
+            tcp[16] = static_cast<u8>(csum >> 8);
+            tcp[17] = static_cast<u8>(csum);
+
+            return g_relay.SendIpv4(packet, total);
+        }
+
+        // Handles one already-parsed TCP segment -- factored out of DrainRelay
+        // so the segment-classification switch below can just `return`
+        // instead of juggling `continue`/`goto` inside the popping loop.
+        // Caller must hold g_vtcp_mutex.
+        void HandleTcpSegment(u32 local_ip, u32 src_ip, u16 src_port,
+                u32 seq, u32 ack, u8 flags, const u8 *payload, size_t payload_len) {
+            const bool is_syn = (flags & TCP_SYN) != 0;
+            const bool is_ack = (flags & TCP_ACK) != 0;
+            const bool is_fin = (flags & TCP_FIN) != 0;
+            const bool is_rst = (flags & TCP_RST) != 0;
+
+            VTcpConn *c = FindVTcpConnByPeer(src_ip);
+
+            if (is_rst) {
+                if (c != nullptr) c->peer_closed = true;
+                return;
+            }
+
+            if (is_syn && !is_ack) {
+                // Incoming connection request (host role). Reply SYN-ACK
+                // immediately -- like a real kernel's TCP stack, not deferred
+                // to Accept(), which only ever dequeues an already-handshaked
+                // connection.
+                if (c != nullptr) return; // already connected to this peer -- stray/retransmitted SYN
+                for (auto &p : g_pending_accepts) {
+                    if (p.used && p.peer_ip == src_ip) return; // already pending
+                }
+                PendingAccept *slot = nullptr;
+                for (auto &p : g_pending_accepts) { if (!p.used) { slot = &p; break; } }
+                if (slot == nullptr) {
+                    LogFormat("BsdBridge: TCP SYN from 0x%08x:%u -- no free accept slot, dropped", src_ip, src_port);
+                    return;
+                }
+                u32 our_isn = 0;
+                ams::os::GenerateRandomBytes(std::addressof(our_isn), sizeof(our_isn));
+                slot->used = true;
+                slot->peer_ip = src_ip;
+                slot->peer_port = src_port;
+                slot->their_isn = seq;
+                slot->our_isn = our_isn;
+                slot->got_final_ack = false;
+                SendTcpSegment(local_ip, src_ip, LdnControlPort, src_port,
+                    our_isn, seq + 1, TCP_SYN | TCP_ACK, nullptr, 0);
+                LogFormat("BsdBridge: TCP SYN from 0x%08x:%u -- replied SYN-ACK", src_ip, src_port);
+                return;
+            }
+
+            if (is_syn && is_ack) {
+                // SYN-ACK reply to our own Connect() (client role): complete
+                // the handshake right here (send the final ACK ourselves --
+                // DrainRelay/this function has g_last_bridged_local_ip
+                // available even though it isn't a BsdBridgeService member).
+                if (c != nullptr && c->syn_sent_awaiting_synack && ack == c->our_isn + 1) {
+                    c->their_seq = seq + 1;
+                    c->our_seq = c->our_isn + 1;
+                    c->syn_sent_awaiting_synack = false;
+                    c->established = true;
+                    SendTcpSegment(local_ip, src_ip, LdnControlPort, src_port,
+                        c->our_seq, c->their_seq, TCP_ACK, nullptr, 0);
+                    LogFormat("BsdBridge: TCP SYN-ACK from 0x%08x:%u -- handshake complete", src_ip, src_port);
+                }
+                return;
+            }
+
+            if (is_fin) {
+                if (c != nullptr) {
+                    c->peer_closed = true;
+                    c->their_seq = seq + 1;
+                    SendTcpSegment(local_ip, src_ip, LdnControlPort, src_port,
+                        c->our_seq, c->their_seq, TCP_ACK, nullptr, 0);
+                }
+                return;
+            }
+
+            if (!is_ack) return; // nothing meaningful left to handle (a bare data-less, flagless segment)
+
+            // Final handshake ACK (host role)?
+            for (auto &p : g_pending_accepts) {
+                if (p.used && p.peer_ip == src_ip && !p.got_final_ack && ack == p.our_isn + 1) {
+                    p.got_final_ack = true;
+                    LogFormat("BsdBridge: TCP final ACK from 0x%08x:%u -- ready for Accept()", src_ip, src_port);
+                    return;
+                }
+            }
+
+            // Otherwise, a data (or pure-ack) segment on an established connection.
+            if (c == nullptr || !c->established || payload_len == 0) return;
+            if (seq != c->their_seq) {
+                // Out of order or a retransmit we've already applied -- drop.
+                // A real peer's own retransmit timer will resend if this was
+                // actually lost, no action needed on our side.
+                return;
+            }
+            if (c->inbox_ready) {
+                // Unconsumed data already queued -- do NOT ack, so the peer's
+                // real TCP stack retransmits once its timer fires (correct
+                // backpressure, not a bug).
+                return;
+            }
+            if (payload_len > VTcpInboxCap) {
+                LogFormat("BsdBridge: TCP data from 0x%08x:%u len=%zu too big, dropped", src_ip, src_port, payload_len);
+                return;
+            }
+            std::memcpy(c->inbox, payload, payload_len);
+            c->inbox_len = payload_len;
+            c->inbox_ready = true;
+            c->their_seq += static_cast<u32>(payload_len);
+            SendTcpSegment(local_ip, src_ip, LdnControlPort, src_port,
+                c->our_seq, c->their_seq, TCP_ACK, nullptr, 0);
+            LogFormat("BsdBridge: TCP data from 0x%08x:%u len=%zu -> filed for fd=%d, acked",
+                src_ip, src_port, payload_len, c->fd);
+        }
+
+        // Pops everything currently sitting in the relay's raw queue and files
+        // each packet by IP protocol: UDP (17) on LdnControlPort ->
+        // g_control_queue, TCP (6) on LdnControlPort -> HandleTcpSegment
+        // above. Called at the top of every bsd:u handler that touches the
+        // relay (RecvFrom, Poll, Select, Accept, Connect), so both channels
+        // stay fed regardless of which one ldn_mitm happens to be polling
+        // this tick.
+        void DrainRelay() {
+            u8 pkt[20 + 20 + slp::RELAY_MTU];
+            size_t pkt_len = 0;
+            while (g_relay.PopIpv4(pkt, sizeof(pkt), &pkt_len) == 1) {
+                if (pkt_len < 20) continue;
+                u8 proto = pkt[9];
+
+                if (proto == 17) { // UDP -- unchanged control-channel path
+                    u32 src_ip = 0; u16 dst_port = 0;
+                    const u8 *payload = nullptr; size_t payload_len = 0;
+                    if (!ParseIpv4Udp(pkt, pkt_len, src_ip, dst_port, payload, payload_len)) continue;
+                    if (dst_port != LdnControlPort) continue;
+                    std::scoped_lock lk(g_control_queue_mutex);
+                    if (g_control_count < ControlQueueSize) {
+                        const size_t tail = (g_control_head + g_control_count) % ControlQueueSize;
+                        // Re-store the FULL raw packet (not just the payload) so
+                        // the control RecvFrom path below can reuse the exact
+                        // same parsing it always has.
+                        size_t copy_len = pkt_len < sizeof(g_control_queue[tail].data) ? pkt_len : sizeof(g_control_queue[tail].data);
+                        std::memcpy(g_control_queue[tail].data, pkt, copy_len);
+                        g_control_queue[tail].len = copy_len;
+                        g_control_count++;
+                    }
+                    continue;
+                }
+
+                if (proto != 6) continue; // not TCP either -- not ours, ignore
+
+                u32 src_ip = 0; u16 src_port = 0, dst_port = 0;
+                u32 seq = 0, ack = 0; u8 flags = 0;
+                const u8 *payload = nullptr; size_t payload_len = 0;
+                if (!ParseIpv4Tcp(pkt, pkt_len, src_ip, src_port, dst_port, seq, ack, flags, payload, payload_len)) continue;
+                if (dst_port != LdnControlPort) continue; // ldn_mitm's TCP station channel is always this port
+
+                std::scoped_lock lk(g_vtcp_mutex);
+                HandleTcpSegment(g_last_bridged_local_ip, src_ip, src_port, seq, ack, flags, payload, payload_len);
+            }
+        }
+    }
+
+    BsdBridgeService::~BsdBridgeService() {}
+
+    slp::RelayBridge &BsdBridgeService::GetRelay() { return g_relay; }
+
+    bool BsdBridgeService::IsRelayConnected() {
+        std::scoped_lock lk(g_relay_mutex);
+        return g_relay.IsConnected();
+    }
+
+    // Shared with EnsureRelayConnected() below -- caller must hold g_relay_mutex.
+    namespace {
+        bool ConnectRelayLocked() {
+            EnsureSocketStack(); // lazy: must precede the relay socket's ::socket()
+            EnsureWatchdogStarted();
+            g_relay_connect_attempted = true;
+
+            char host[128];
+            u16 port = 0;
+            slpnx::cfg::GetRuntimeCfg().GetSelectedHostPort(host, sizeof(host), &port);
+
+            Result rc = g_relay.Connect(host, port);
+            LogFormat("BsdBridge: relay connect to %s:%u -> %s", host, port,
+                R_SUCCEEDED(rc) ? "ok" : "FAILED");
+            return R_SUCCEEDED(rc);
+        }
+    }
+
+    void BsdBridgeService::ForceReconnect() {
+        // Drop the current socket (if any) and reconnect RIGHT NOW against
+        // whatever host/port is now selected in RuntimeCfg -- called from
+        // slpnx::ipc::ConfigService::Reconnect (cfg/cfg_service.cpp), which
+        // the overlay invokes right after SelectServer. Reconnects inline
+        // rather than just clearing g_relay_connect_attempted and waiting
+        // for the next bridged SendTo/RecvFrom: pressing Reconnect while
+        // ldn_mitm is idle (no active scan/host) needs to take effect
+        // immediately, not silently wait for other traffic to trigger it.
+        std::scoped_lock lk(g_relay_mutex);
+        g_relay_enabled = true; // Reconnect implies "on" even if Stop was pressed earlier
+        g_relay.Close();
+        g_relay_connect_attempted = false;
+        g_last_bridge_activity_ms.store(0, std::memory_order_relaxed);
+        ConnectRelayLocked();
+    }
+
+    void BsdBridgeService::Stop() {
+        // Closes the relay and stops EnsureRelayConnected() from silently
+        // reconnecting on the next bridged traffic -- Reconnect alone has
+        // no way to express "stay off", so Start/Stop exist separately.
+        std::scoped_lock lk(g_relay_mutex);
+        g_relay_enabled = false;
+        g_relay.Close();
+        g_relay_connect_attempted = false;
+        g_last_bridge_activity_ms.store(0, std::memory_order_relaxed);
+        LogFormat("BsdBridge: Stop() -- relay disabled");
+    }
+
+    void BsdBridgeService::Start() {
+        std::scoped_lock lk(g_relay_mutex);
+        g_relay_enabled = true;
+        if (!g_relay.IsConnected()) {
+            g_relay_connect_attempted = false;
+            ConnectRelayLocked();
+        }
+        LogFormat("BsdBridge: Start() -- relay enabled");
+    }
+
+    bool BsdBridgeService::IsRelayEnabled() {
+        std::scoped_lock lk(g_relay_mutex);
+        return g_relay_enabled;
+    }
+
+    u32 BsdBridgeService::GetLocalIp() {
+        std::scoped_lock lk(g_relay_mutex);
+        return g_last_bridged_local_ip;
+    }
+
+    u32 BsdBridgeService::GetRealIp() {
+        std::scoped_lock lk(g_relay_mutex);
+        EnsureSocketStack(); // lazy, same as ConnectRelayLocked -- safe to call repeatedly
+        u32 real_ip = 0;
+        if (R_SUCCEEDED(nifmGetCurrentIpAddress(&real_ip)) && real_ip != 0) {
+            return ntohl(real_ip);
+        }
+        return 0;
+    }
+
+    bool BsdBridgeService::EnsureRelayConnected() {
+        std::scoped_lock lk(g_relay_mutex);
+        if (!g_relay_enabled) return false;
+        if (g_relay.IsConnected()) return true;
+        if (g_relay_connect_attempted) return false; // don't retry-storm every call
+        return ConnectRelayLocked();
+    }
+
+    bool BsdBridgeService::ShouldMitm(const sm::MitmProcessInfo &client_info) {
+        // ldn_mitm's own program_id -- see notes/, confirmed from its
+        // res/app.json this session (0x4200000000000010, the real
+        // upstream ldn_mitm's own reserved id, distinct from every other
+        // project's homebrew id on this SD card).
+        constexpr u64 LdnMitmProgramId = 0x4200000000000010ULL;
+        bool target = client_info.program_id.value == LdnMitmProgramId;
+        LogFormat("BsdBridge ShouldMitm: pid=%lu program_id=0x%016lx -> %s",
+            client_info.process_id.value, client_info.program_id.value, target ? "YES" : "no");
+        return target;
+    }
+
+    // ---- generic forwarding helpers ---------------------------------------
+
+    namespace {
+        // {ret, errno} pair, matching libnx's own _bsdDispatchImpl convention
+        // (services/bsd.c): every bsd:u command replies with this exact
+        // 8-byte struct first (ret at offset 0, errno at offset 4), with any
+        // extra per-command output appended after. See the interface header
+        // for why the Out<> declaration order (out_ret-ish field first, then
+        // out_errno) has to match this, not just this struct's field order.
+        struct RetErrno { s32 ret; s32 err; };
+    }
+
+    Result BsdBridgeService::RegisterClient(sf::Out<u64> out_result, const LibraryConfigData &config,
+            const sf::ClientProcessId &client_pid, u64 tmem_size, sf::CopyHandle &&transfer_memory) {
+        AMS_UNUSED(client_pid); // nnSdk's placeholder field, unused -- see override_pid below for the real pid forwarding
+        struct {
+            LibraryConfigData config;
+            u64 pid_placeholder;
+            u64 tmem_size;
+        } in = { config, 0, tmem_size };
+        u64 out = 0;
+        // in_send_pid alone makes the KERNEL stamp OUR bridge process's own
+        // real pid onto the forwarded request -- we're the one physically
+        // sending it. That's wrong: the real bsd:u service needs to see
+        // ldn_mitm's real pid, not ours, or its own per-client bookkeeping
+        // (RegisterClient here, StartMonitoring right after) ends up
+        // tracking the wrong process, which can lead to the real service
+        // (or Atmosphere's mitm session plumbing) deciding to tear the
+        // session down. override_pid is Atmosphere's own mechanism for a
+        // mitm to forward the ORIGINAL client's pid (sf_mitm_dispatch.h:
+        // only takes effect when in_send_pid is also set, and stamps the
+        // TLS pid buffer with the 0xFFFE... prefix the patched kernel
+        // accepts from a legitimate mitm).
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 0, in, out,
+            .in_send_pid = true,
+            .in_num_handles = 1,
+            .in_handles = { transfer_memory.GetOsHandle() },
+            .override_pid = m_client_info.process_id.value);
+        out_result.SetValue(out);
+        LogFormat("BsdBridge: RegisterClient(tmem_size=%lu) -> rc=0x%x result=%lu", tmem_size, rc.GetValue(), out);
+        return rc;
+    }
+
+    Result BsdBridgeService::RegisterClientShared(sf::Out<u64> out_result, const LibraryConfigData &config,
+            const sf::ClientProcessId &client_pid, u64 tmem_size) {
+        AMS_UNUSED(client_pid);
+        struct {
+            LibraryConfigData config;
+            u64 pid_placeholder;
+            u64 tmem_size;
+        } in = { config, 0, tmem_size };
+        u64 out = 0;
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 33, in, out,
+            .in_send_pid = true,
+            .override_pid = m_client_info.process_id.value);
+        out_result.SetValue(out);
+        return rc;
+    }
+
+    // Cmd 1 StartMonitoring is intentionally not implemented here -- see
+    // the interface header for why: it auto-forwards as raw, untouched
+    // bytes via ForwardRequest, which is the only way to satisfy the SF
+    // framework's own PrepareForProcess validation for this specific
+    // command (declaring it ourselves, in any Out<>/ClientProcessId shape
+    // tried, always ends up mismatched against what the real client's
+    // wire message can hold).
+
+    Result BsdBridgeService::Socket(sf::Out<s32> out_fd, sf::Out<s32> out_errno, s32 domain, s32 type, s32 protocol) {
+        struct { s32 domain, type, protocol; } in = { domain, type, protocol };
+        RetErrno out{};
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 2, in, out);
+        out_fd.SetValue(out.ret);
+        out_errno.SetValue(out.err);
+        TrackFd(out.ret, type); // for Bind's UDP-vs-TCP discrimination
+        LogFormat("BsdBridge: Socket(domain=%d type=%d proto=%d) -> fd=%d errno=%d",
+            domain, type, protocol, out.ret, out.err);
+        return rc;
+    }
+
+    Result BsdBridgeService::SocketExempt(sf::Out<s32> out_fd, sf::Out<s32> out_errno, s32 domain, s32 type, s32 protocol) {
+        struct { s32 domain, type, protocol; } in = { domain, type, protocol };
+        RetErrno out{};
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 3, in, out);
+        out_fd.SetValue(out.ret);
+        out_errno.SetValue(out.err);
+        TrackFd(out.ret, type);
+        return rc;
+    }
+
+    Result BsdBridgeService::Open(sf::Out<s32> out_fd, sf::Out<s32> out_errno, s32 flags, const sf::InBuffer &path) {
+        RetErrno out{};
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 4, flags, out,
+            .buffer_attrs = { SfBufferAttr_In | SfBufferAttr_HipcAutoSelect },
+            .buffers = { { path.GetPointer(), path.GetSize() } });
+        out_fd.SetValue(out.ret);
+        out_errno.SetValue(out.err);
+        return rc;
+    }
+
+    namespace {
+        // Shared by Poll/Select: is THIS specific fd (the UDP control fd, the
+        // virtual TCP listener, or an established virtual TCP connection)
+        // sitting on data ldn_mitm hasn't read yet? Callers must call
+        // DrainRelay() first so these flags are current.
+        bool VFdHasPendingRead(s32 poll_fd, s32 bridged_udp_fd) {
+            if (poll_fd < 0) return false; // -1 = "ignored" poll slot; must never match an also-unset -1 tracked fd
+            if (poll_fd == bridged_udp_fd) {
+                std::scoped_lock lk(g_control_queue_mutex);
+                return g_control_count > 0;
+            }
+            std::scoped_lock lk(g_vtcp_mutex);
+            if (poll_fd == g_tcp_listen_fd) {
+                // Only report readable once a connection is FULLY handshaked
+                // (got_final_ack) -- accept() should never return before
+                // that, matching real TCP semantics; a raw not-yet-ACKed SYN
+                // isn't something Accept() can do anything with yet.
+                for (auto &p : g_pending_accepts) if (p.used && p.got_final_ack) return true;
+                return false;
+            }
+            VTcpConn *c = FindVTcpConnByFd(poll_fd);
+            return c != nullptr && (c->inbox_ready || c->peer_closed);
+        }
+    }
+
+    Result BsdBridgeService::Select(sf::Out<s32> out_count, sf::Out<s32> out_errno, const SelectInData &in_data,
+            const sf::InAutoSelectBuffer &readfds_in, const sf::InAutoSelectBuffer &writefds_in,
+            const sf::InAutoSelectBuffer &errorfds_in,
+            sf::OutAutoSelectBuffer readfds_out, sf::OutAutoSelectBuffer writefds_out,
+            sf::OutAutoSelectBuffer errorfds_out) {
+        DrainRelay();
+
+        // Same synthetic-fd problem as Poll (see its own comment): a
+        // host-role accepted virtual connection's fd was never allocated by
+        // the real bsd:u service, so it must never appear in a forwarded
+        // readfds bitmask. Clear those bits before forwarding and answer
+        // them ourselves afterward, mirroring the Poll fix. ldn_mitm itself
+        // only ever uses ::poll (lan_protocol.cpp Pollable::Poll), not
+        // ::select, so this path is untested against real traffic -- kept
+        // correct anyway since some OTHER mitm'd process could still reach
+        // it via the generic forward below for fds that aren't ours.
+        constexpr s32 MaxSelectFds = 1024;
+        const s32 nfds = in_data.nfds;
+        const size_t nwords = (nfds > 0 && nfds <= MaxSelectFds) ? (static_cast<size_t>(nfds) + 31) / 32 : 0;
+        const size_t nbytes = nwords * sizeof(u32);
+
+        if (nwords == 0 || readfds_in.GetSize() < nbytes || readfds_out.GetSize() < nbytes) {
+            // Unexpected shape -- forward unconditionally rather than risk
+            // mishandling it ourselves.
+            RetErrno out{};
+            Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 5, in_data, out,
+                .buffer_attrs = {
+                    SfBufferAttr_In | SfBufferAttr_HipcAutoSelect, SfBufferAttr_In | SfBufferAttr_HipcAutoSelect,
+                    SfBufferAttr_In | SfBufferAttr_HipcAutoSelect,
+                    SfBufferAttr_Out | SfBufferAttr_HipcAutoSelect, SfBufferAttr_Out | SfBufferAttr_HipcAutoSelect,
+                    SfBufferAttr_Out | SfBufferAttr_HipcAutoSelect },
+                .buffers = {
+                    { readfds_in.GetPointer(), readfds_in.GetSize() }, { writefds_in.GetPointer(), writefds_in.GetSize() },
+                    { errorfds_in.GetPointer(), errorfds_in.GetSize() },
+                    { readfds_out.GetPointer(), readfds_out.GetSize() }, { writefds_out.GetPointer(), writefds_out.GetSize() },
+                    { errorfds_out.GetPointer(), errorfds_out.GetSize() } });
+            out_count.SetValue(out.ret);
+            out_errno.SetValue(out.err);
+            return rc;
+        }
+
+        u32 forward_readfds[MaxSelectFds / 32];
+        const u32 *orig_readfds = reinterpret_cast<const u32 *>(readfds_in.GetPointer());
+        std::memcpy(forward_readfds, orig_readfds, nbytes);
+
+        // Clear any synthetic fd's bit before forwarding -- the trailing
+        // inject() loop below answers for it afterward regardless (it
+        // walks every used vtcp conn directly, not the caller's bitmask).
+        for (s32 fd = 0; fd < nfds; fd++) {
+            if (!(orig_readfds[fd / 32] & (1u << (fd % 32)))) continue;
+            std::scoped_lock lk(g_vtcp_mutex);
+            VTcpConn *c = FindVTcpConnByFd(fd);
+            if (c != nullptr && c->fd >= 1000) {
+                forward_readfds[fd / 32] &= ~(1u << (fd % 32)); // never forward
+            }
+        }
+
+        SelectInData forward_in = in_data;
+        RetErrno out{};
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 5, forward_in, out,
+            .buffer_attrs = {
+                SfBufferAttr_In | SfBufferAttr_HipcAutoSelect, SfBufferAttr_In | SfBufferAttr_HipcAutoSelect,
+                SfBufferAttr_In | SfBufferAttr_HipcAutoSelect,
+                SfBufferAttr_Out | SfBufferAttr_HipcAutoSelect, SfBufferAttr_Out | SfBufferAttr_HipcAutoSelect,
+                SfBufferAttr_Out | SfBufferAttr_HipcAutoSelect },
+            .buffers = {
+                { forward_readfds, nbytes }, { writefds_in.GetPointer(), writefds_in.GetSize() },
+                { errorfds_in.GetPointer(), errorfds_in.GetSize() },
+                { readfds_out.GetPointer(), readfds_out.GetSize() }, { writefds_out.GetPointer(), writefds_out.GetSize() },
+                { errorfds_out.GetPointer(), errorfds_out.GetSize() } });
+        s32 count = out.ret;
+        out_errno.SetValue(out.err);
+
+        // Relay-readability injection, select()'s fd_set bit-mask form
+        // (libnx fd_set: u32 words of NFDBITS=32) -- now covers the UDP
+        // control fd, the virtual TCP listener, and every established
+        // virtual TCP connection, not just the one control fd.
+        auto inject = [&](s32 fd) {
+            if (fd < 0 || !VFdHasPendingRead(fd, m_bridged_fd)) return;
+            if (readfds_out.GetSize() < (static_cast<size_t>(fd) / 32 + 1) * sizeof(u32)) return;
+            u32 *words = reinterpret_cast<u32 *>(readfds_out.GetPointer());
+            u32 &word = words[fd / 32];
+            const u32 bit = 1u << (fd % 32);
+            if (!(word & bit)) {
+                word |= bit;
+                if (count >= 0) count++;
+            }
+        };
+        inject(m_bridged_fd);
+        inject(g_tcp_listen_fd);
+        for (auto &c : g_vtcp_conns) if (c.used) inject(c.fd);
+
+        out_count.SetValue(count);
+        return rc;
+    }
+
+    Result BsdBridgeService::Poll(sf::Out<s32> out_count, sf::Out<s32> out_errno, const sf::InAutoSelectBuffer &fds_in,
+            sf::OutAutoSelectBuffer fds_out, s32 nfds, s32 timeout) {
+        DrainRelay();
+
+        // Host-role accepted virtual connections have a SYNTHETIC fd (see
+        // Accept above) that the REAL bsd:u service has never heard of --
+        // forwarding a poll request that names one is asking the real
+        // service about an fd it never allocated, which silently corrupts
+        // the Poll result for the whole batch (every other fd in the same
+        // call comes back wrong too, not just the unknown one). Split the
+        // polled set into real fds (forwarded normally) and ours (answered
+        // entirely from VFdHasPendingRead, never sent to the real service
+        // at all).
+        constexpr s32 MaxPollFds = 32;
+        if (nfds < 0 || static_cast<size_t>(nfds) > MaxPollFds ||
+                fds_in.GetSize() < static_cast<size_t>(nfds) * sizeof(struct pollfd) ||
+                fds_out.GetSize() < static_cast<size_t>(nfds) * sizeof(struct pollfd)) {
+            // Unexpected shape -- forward unconditionally rather than risk
+            // mishandling it ourselves.
+            struct { s32 nfds, timeout; } in = { nfds, timeout };
+            RetErrno out{};
+            Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 6, in, out,
+                .buffer_attrs = { SfBufferAttr_In | SfBufferAttr_HipcAutoSelect, SfBufferAttr_Out | SfBufferAttr_HipcAutoSelect },
+                .buffers = { { fds_in.GetPointer(), fds_in.GetSize() }, { fds_out.GetPointer(), fds_out.GetSize() } });
+            out_count.SetValue(out.ret);
+            out_errno.SetValue(out.err);
+            return rc;
+        }
+
+        const struct pollfd *pfds_in = reinterpret_cast<const struct pollfd *>(fds_in.GetPointer());
+        struct pollfd *pfds_out = reinterpret_cast<struct pollfd *>(fds_out.GetPointer());
+
+        struct pollfd forward_in[MaxPollFds];
+        struct pollfd forward_out[MaxPollFds]{};
+        s32 forward_nfds = 0;
+        s32 forward_index[MaxPollFds]; // forward_in[j] came from pfds_in[forward_index[j]]
+
+        for (s32 i = 0; i < nfds; i++) {
+            pfds_out[i].fd = pfds_in[i].fd;
+            pfds_out[i].events = pfds_in[i].events;
+            pfds_out[i].revents = 0;
+
+            bool is_synthetic = false;
+            {
+                std::scoped_lock lk(g_vtcp_mutex);
+                VTcpConn *c = FindVTcpConnByFd(pfds_in[i].fd);
+                is_synthetic = (c != nullptr && c->fd >= 1000);
+            }
+            if (is_synthetic) continue; // answered entirely below, never forwarded
+
+            forward_index[forward_nfds] = i;
+            forward_in[forward_nfds] = pfds_in[i];
+            forward_nfds++;
+        }
+
+        s32 count = 0;
+        if (forward_nfds > 0) {
+            struct { s32 nfds, timeout; } in = { forward_nfds, timeout };
+            RetErrno out{};
+            serviceMitmDispatchInOut(m_forward_service.get(), 6, in, out,
+                .buffer_attrs = { SfBufferAttr_In | SfBufferAttr_HipcAutoSelect, SfBufferAttr_Out | SfBufferAttr_HipcAutoSelect },
+                .buffers = { { forward_in, sizeof(struct pollfd) * static_cast<size_t>(forward_nfds) },
+                            { forward_out, sizeof(struct pollfd) * static_cast<size_t>(forward_nfds) } });
+            out_errno.SetValue(out.err);
+            if (out.ret > 0) {
+                for (s32 j = 0; j < forward_nfds; j++) {
+                    pfds_out[forward_index[j]].revents = forward_out[j].revents;
+                    if (forward_out[j].revents != 0) count++;
+                }
+            }
+        } else {
+            out_errno.SetValue(0);
+        }
+
+        // Poll interception: the real socket(s) never see relay traffic, so
+        // without this ldn_mitm's worker (lan_protocol.cpp Pollable::Poll ->
+        // onRead only on POLLIN) would never call RecvFrom/Accept even while
+        // data sat waiting in our queues. For every polled fd that's one of
+        // ours (the UDP control fd, the virtual TCP listener, or an
+        // established virtual TCP connection, synthetic or not) and has
+        // something pending, OR in POLLIN and fix up the returned count.
+        for (s32 i = 0; i < nfds; i++) {
+            if (pfds_out[i].revents & (POLLIN | POLLPRI | POLLERR | POLLHUP | POLLNVAL)) continue;
+            if (!VFdHasPendingRead(pfds_out[i].fd, m_bridged_fd)) continue;
+            pfds_out[i].revents |= POLLIN;
+            count++;
+            LogFormat("BsdBridge: Poll injected POLLIN for fd=%d", pfds_out[i].fd);
+        }
+
+        out_count.SetValue(count);
+        return ResultSuccess();
+    }
+
+    Result BsdBridgeService::Sysctl(sf::Out<s32> out_ret, sf::Out<s32> out_errno, sf::Out<u64> out_oldlen,
+            const sf::InBuffer &name, const sf::InBuffer &new_val, sf::OutBuffer old_val_out) {
+        struct { s32 ret; s32 err; u64 oldlen; } out{};
+        Result rc = serviceMitmDispatchOut(m_forward_service.get(), 7, out,
+            .buffer_attrs = { SfBufferAttr_In | SfBufferAttr_HipcAutoSelect, SfBufferAttr_In | SfBufferAttr_HipcAutoSelect,
+                              SfBufferAttr_Out | SfBufferAttr_HipcAutoSelect },
+            .buffers = { { name.GetPointer(), name.GetSize() }, { new_val.GetPointer(), new_val.GetSize() },
+                        { old_val_out.GetPointer(), old_val_out.GetSize() } });
+        out_ret.SetValue(out.ret);
+        out_errno.SetValue(out.err);
+        out_oldlen.SetValue(out.oldlen);
+        return rc;
+    }
+
+    Result BsdBridgeService::Recv(sf::Out<s32> out_size, sf::Out<s32> out_errno, s32 fd, s32 flags,
+            sf::OutAutoSelectBuffer buffer) {
+        struct { s32 fd, flags; } in = { fd, flags };
+        RetErrno out{};
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 8, in, out,
+            .buffer_attrs = { SfBufferAttr_Out | SfBufferAttr_HipcAutoSelect },
+            .buffers = { { buffer.GetPointer(), buffer.GetSize() } });
+        out_size.SetValue(out.ret);
+        out_errno.SetValue(out.err);
+        return rc;
+    }
+
+    // ---- the bridged commands ----------------------------------------------
+
+    Result BsdBridgeService::Bind(sf::Out<s32> out_ret, sf::Out<s32> out_errno, s32 fd, const sf::InAutoSelectBuffer &addr) {
+        // Always forward the real Bind (harmless -- there's no real local
+        // network for it to conflict with, and if the console's WiFi
+        // interface happens to be usable this keeps ldn_mitm's own
+        // real-network path alive as a bonus, not a replacement).
+        struct { s32 fd; } in = { fd };
+        RetErrno out{};
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 13, in, out,
+            .buffer_attrs = { SfBufferAttr_In | SfBufferAttr_HipcAutoSelect },
+            .buffers = { { addr.GetPointer(), addr.GetSize() } });
+        out_ret.SetValue(out.ret);
+        out_errno.SetValue(out.err);
+
+        if (addr.GetSize() >= sizeof(struct sockaddr_in)) {
+            struct sockaddr_in sin;
+            std::memcpy(&sin, addr.GetPointer(), sizeof(sin));
+            u16 port = ntohs(sin.sin_port);
+            bool is_udp = GetTrackedType(fd) == SOCK_DGRAM;
+            if (port == LdnControlPort && !is_udp) {
+                LogFormat("BsdBridge: Bind fd=%d -> port %u but NOT UDP (tcp listener); forwarding only",
+                    fd, port);
+            }
+            if (port == LdnControlPort && is_udp) {
+                m_bridged_fd = fd;
+                LogFormat("BsdBridge: Bind fd=%d -> port %u matched (UDP), bridging this socket to the relay",
+                    fd, port);
+
+                // Learn our own local IP the same way ldn_mitm itself would
+                // see it (nifmGetCurrentIpAddress internally resolves the
+                // same interface state GetSockName reads here) -- see the
+                // header's own comment on why this must stay consistent
+                // rather than inventing a separate address.
+                u8 sockname_buf[sizeof(struct sockaddr_in)];
+                RetErrno gsn_out{};
+                Result gsn_rc = serviceMitmDispatchInOut(m_forward_service.get(), 16, in, gsn_out,
+                    .buffer_attrs = { SfBufferAttr_Out | SfBufferAttr_HipcAutoSelect },
+                    .buffers = { { sockname_buf, sizeof(sockname_buf) } });
+                if (R_SUCCEEDED(gsn_rc) && gsn_out.err == 0) {
+                    struct sockaddr_in local_sin;
+                    std::memcpy(&local_sin, sockname_buf, sizeof(local_sin));
+                    m_bridged_local_ip = ntohl(local_sin.sin_addr.s_addr);
+                }
+
+                // Fallback: with no associated WiFi interface GetSockName can
+                // legitimately report 0.0.0.0; the relay routes replies by
+                // the source IP we embed in each packet, so a zero source
+                // would make every response unroutable. nifm knows our real
+                // address even when the raw socket view doesn't.
+                if (m_bridged_local_ip == 0) {
+                    u32 nifm_ip = 0;
+                    EnsureSocketStack(); // nifmGetCurrentIpAddress needs nifm initialized
+                    if (R_SUCCEEDED(nifmGetCurrentIpAddress(&nifm_ip)) && nifm_ip != 0) {
+                        m_bridged_local_ip = ntohl(nifm_ip);
+                        LogFormat("BsdBridge: GetSockName gave 0.0.0.0, using nifm ip instead");
+                    }
+                }
+                LogFormat("BsdBridge: bridged socket local ip = 0x%08x", m_bridged_local_ip);
+                {
+                    std::scoped_lock lk(g_relay_mutex);
+                    g_last_bridged_local_ip = m_bridged_local_ip;
+                }
+
+                EnsureRelayConnected();
+            }
+        }
+        return rc;
+    }
+
+    Result BsdBridgeService::SendTo(sf::Out<s32> out_size, sf::Out<s32> out_errno, s32 fd, s32 flags,
+            const sf::InAutoSelectBuffer &buffer, const sf::InAutoSelectBuffer &addr) {
+        // ldn_mitm's TCP "station" socket also goes through SendTo (see
+        // TcpLanSocketBase::sendto -- ::sendto(fd,buf,len,0,nullptr,0), addr
+        // always empty since it's a connected socket). Route it into the
+        // virtual-TCP tunnel instead of falling through to the UDP path
+        // below or the generic forward above.
+        {
+            std::scoped_lock lk(g_vtcp_mutex);
+            VTcpConn *c = FindVTcpConnByFd(fd);
+            if (c != nullptr) {
+                if (!c->established || !EnsureRelayConnected()) {
+                    out_errno.SetValue(EIO);
+                    out_size.SetValue(-1);
+                    return ResultSuccess();
+                }
+                const size_t payload_len = buffer.GetSize();
+                if (payload_len > VTcpInboxCap) {
+                    out_errno.SetValue(EMSGSIZE);
+                    out_size.SetValue(-1);
+                    return ResultSuccess();
+                }
+                // Real TCP data segment: PSH|ACK, our current seq/ack. No
+                // retransmission on our side if this is lost -- ldn_mitm's
+                // own higher-level protocol (waiting for a SyncNetwork reply
+                // to a Connect, etc.) is what notices and retries, same as it
+                // would over a real flaky network.
+                ssize_t sent = SendTcpSegment(m_bridged_local_ip, c->peer_ip, LdnControlPort, c->peer_port,
+                    c->our_seq, c->their_seq, TCP_PSH | TCP_ACK, buffer.GetPointer(), payload_len);
+                LogFormat("BsdBridge: SendTo(tcp fd=%d, %zu bytes -> peer 0x%08x:%u seq=%u) relay_sent=%zd",
+                    fd, payload_len, c->peer_ip, c->peer_port, c->our_seq, sent);
+                if (sent >= 0) c->our_seq += static_cast<u32>(payload_len);
+                TouchBridgeActivity();
+                out_errno.SetValue(sent >= 0 ? 0 : EIO);
+                out_size.SetValue(sent >= 0 ? static_cast<s32>(payload_len) : -1);
+                return ResultSuccess();
+            }
+        }
+
+        if (!IsBridged(fd)) {
+            struct { s32 fd, flags; } in = { fd, flags };
+            RetErrno out{};
+            Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 11, in, out,
+                .buffer_attrs = { SfBufferAttr_In | SfBufferAttr_HipcAutoSelect, SfBufferAttr_In | SfBufferAttr_HipcAutoSelect },
+                .buffers = { { buffer.GetPointer(), buffer.GetSize() }, { addr.GetPointer(), addr.GetSize() } });
+            out_size.SetValue(out.ret);
+            out_errno.SetValue(out.err);
+            return rc;
+        }
+
+        // Bridged socket: build a raw IPv4+UDP packet matching what a real
+        // local broadcast/unicast would look like on the wire, and hand it
+        // to the relay bridge -- never touching the real (nonexistent)
+        // local network for this socket.
+        if (!EnsureRelayConnected()) {
+            out_errno.SetValue(EIO);
+            out_size.SetValue(-1);
+            return ResultSuccess();
+        }
+
+        struct sockaddr_in dst_sin{};
+        if (addr.GetSize() >= sizeof(dst_sin)) {
+            std::memcpy(&dst_sin, addr.GetPointer(), sizeof(dst_sin));
+        }
+        u32 dst_ip = ntohl(dst_sin.sin_addr.s_addr);
+        u16 dst_port = ntohs(dst_sin.sin_port);
+
+        const size_t payload_len = buffer.GetSize();
+        u8 packet[20 + 8 + slp::RELAY_MTU];
+        size_t total = 20 + 8 + payload_len;
+        if (total > sizeof(packet)) {
+            out_errno.SetValue(EMSGSIZE);
+            out_size.SetValue(-1);
+            return ResultSuccess();
+        }
+
+        u8 *ip = packet;
+        ip[0] = 0x45; ip[1] = 0x00;
+        ip[2] = static_cast<u8>(total >> 8); ip[3] = static_cast<u8>(total);
+        ip[4] = 0; ip[5] = 0; ip[6] = 0; ip[7] = 0;
+        ip[8] = 64; ip[9] = 17; ip[10] = 0; ip[11] = 0;
+        ip[12] = static_cast<u8>(m_bridged_local_ip >> 24); ip[13] = static_cast<u8>(m_bridged_local_ip >> 16);
+        ip[14] = static_cast<u8>(m_bridged_local_ip >> 8);  ip[15] = static_cast<u8>(m_bridged_local_ip);
+        ip[16] = static_cast<u8>(dst_ip >> 24); ip[17] = static_cast<u8>(dst_ip >> 16);
+        ip[18] = static_cast<u8>(dst_ip >> 8);  ip[19] = static_cast<u8>(dst_ip);
+
+        u8 *udp = packet + 20;
+        u16 udp_len = static_cast<u16>(8 + payload_len);
+        udp[0] = static_cast<u8>(LdnControlPort >> 8); udp[1] = static_cast<u8>(LdnControlPort);
+        udp[2] = static_cast<u8>(dst_port >> 8); udp[3] = static_cast<u8>(dst_port);
+        udp[4] = static_cast<u8>(udp_len >> 8); udp[5] = static_cast<u8>(udp_len);
+        udp[6] = 0; udp[7] = 0;
+        std::memcpy(packet + 28, buffer.GetPointer(), payload_len);
+
+        ssize_t sent = GetRelay().SendIpv4(packet, total);
+        LogFormat("BsdBridge: SendTo(bridged fd=%d, %zu bytes -> dst 0x%08x:%u) relay_sent=%zd",
+            fd, payload_len, dst_ip, dst_port, sent);
+        TouchBridgeActivity();
+
+        out_errno.SetValue(sent >= 0 ? 0 : EIO);
+        out_size.SetValue(sent >= 0 ? static_cast<s32>(payload_len) : -1);
+        return ResultSuccess();
+    }
+
+    Result BsdBridgeService::RecvFrom(sf::Out<s32> out_ret, sf::Out<s32> out_errno, sf::Out<u32> out_addrlen, s32 fd,
+            s32 flags, sf::OutAutoSelectBuffer buffer, sf::OutAutoSelectBuffer addr_out) {
+        DrainRelay();
+
+        // Virtual-TCP fd (ldn_mitm's LDN station socket -- see SendTo above).
+        {
+            std::scoped_lock lk(g_vtcp_mutex);
+            VTcpConn *c = FindVTcpConnByFd(fd);
+            if (c != nullptr) {
+                if (!c->inbox_ready) {
+                    out_ret.SetValue(c->peer_closed ? 0 : -1);
+                    out_errno.SetValue(c->peer_closed ? 0 : EWOULDBLOCK);
+                    out_addrlen.SetValue(0);
+                    return ResultSuccess();
+                }
+                size_t deliver = c->inbox_len;
+                if (deliver > buffer.GetSize()) deliver = buffer.GetSize();
+                std::memcpy(buffer.GetPointer(), c->inbox, deliver);
+                // Each queued entry is one complete LAN packet (a plain UDP
+                // datagram in both TCP-tunnel modes now), so a full clear is
+                // correct in both -- no message-boundary/stream concerns.
+                c->inbox_ready = false;
+                c->inbox_len = 0;
+
+                struct sockaddr_in src_sin{};
+                src_sin.sin_family = AF_INET;
+                src_sin.sin_port = htons(c->peer_port);
+                src_sin.sin_addr.s_addr = htonl(c->peer_ip);
+                size_t addrlen = (addr_out.GetSize() < sizeof(src_sin)) ? addr_out.GetSize() : sizeof(src_sin);
+                std::memcpy(addr_out.GetPointer(), &src_sin, addrlen);
+
+                LogFormat("BsdBridge: RecvFrom(tcp fd=%d) delivered %zu bytes from 0x%08x:%u", fd, deliver, c->peer_ip, c->peer_port);
+                TouchBridgeActivity();
+                out_ret.SetValue(static_cast<s32>(deliver));
+                out_errno.SetValue(0);
+                out_addrlen.SetValue(static_cast<u32>(addrlen));
+                return ResultSuccess();
+            }
+        }
+
+        if (!IsBridged(fd)) {
+            struct { s32 fd, flags; } in = { fd, flags };
+            struct { s32 ret; s32 err; u32 addrlen; } out{};
+            Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 9, in, out,
+                .buffer_attrs = { SfBufferAttr_Out | SfBufferAttr_HipcAutoSelect, SfBufferAttr_Out | SfBufferAttr_HipcAutoSelect },
+                .buffers = { { buffer.GetPointer(), buffer.GetSize() }, { addr_out.GetPointer(), addr_out.GetSize() } });
+            out_ret.SetValue(out.ret);
+            out_errno.SetValue(out.err);
+            out_addrlen.SetValue(out.addrlen);
+            return rc;
+        }
+
+        // Deliver one packet from g_control_queue (filed by DrainRelay above,
+        // which is now the only caller of GetRelay().PopIpv4() -- see its own
+        // comment for why RecvFrom no longer pops the shared relay queue
+        // directly).
+        u8 ip_packet[20 + 8 + slp::RELAY_MTU];
+        size_t ip_len = 0;
+        {
+            std::scoped_lock lk(g_control_queue_mutex);
+            if (g_control_count == 0) {
+                out_ret.SetValue(-1);
+                out_errno.SetValue(EWOULDBLOCK);
+                out_addrlen.SetValue(0);
+                return ResultSuccess();
+            }
+            ControlPacket &pkt = g_control_queue[g_control_head];
+            ip_len = pkt.len < sizeof(ip_packet) ? pkt.len : sizeof(ip_packet);
+            std::memcpy(ip_packet, pkt.data, ip_len);
+            g_control_head = (g_control_head + 1) % ControlQueueSize;
+            g_control_count--;
+        }
+
+        u32 src_ip = 0; u16 dst_port_unused = 0;
+        const u8 *payload = nullptr; size_t payload_len = 0;
+        if (!ParseIpv4Udp(ip_packet, ip_len, src_ip, dst_port_unused, payload, payload_len)) {
+            out_ret.SetValue(-1);
+            out_errno.SetValue(EWOULDBLOCK);
+            out_addrlen.SetValue(0);
+            return ResultSuccess();
+        }
+        u8 ihl = (ip_packet[0] & 0x0F) * 4;
+        const u8 *udp = ip_packet + ihl;
+        u16 src_port = static_cast<u16>((udp[0] << 8) | udp[1]);
+        if (payload_len > buffer.GetSize()) payload_len = buffer.GetSize();
+
+        std::memcpy(buffer.GetPointer(), payload, payload_len);
+
+        struct sockaddr_in src_sin{};
+        src_sin.sin_family = AF_INET;
+        src_sin.sin_port = htons(src_port);
+        src_sin.sin_addr.s_addr = htonl(src_ip);
+        size_t addrlen = (addr_out.GetSize() < sizeof(src_sin)) ? addr_out.GetSize() : sizeof(src_sin);
+        std::memcpy(addr_out.GetPointer(), &src_sin, addrlen);
+
+        LogFormat("BsdBridge: RecvFrom(bridged fd=%d) delivered %zu bytes from relay (src 0x%08x:%u)",
+            fd, payload_len, src_ip, src_port);
+        TouchBridgeActivity();
+
+        out_ret.SetValue(static_cast<s32>(payload_len));
+        out_errno.SetValue(0);
+        out_addrlen.SetValue(static_cast<u32>(addrlen));
+        return ResultSuccess();
+    }
+
+    Result BsdBridgeService::Close(sf::Out<s32> out_ret, sf::Out<s32> out_errno, s32 fd) {
+        // Host-role accepted virtual connections have a SYNTHETIC fd (see
+        // Accept below) that was never a real bsd:u fd -- forwarding Close
+        // for one to the real service would close whatever unrelated real fd
+        // happens to share that number. Everything else (the UDP control fd,
+        // the TCP listener fd, and a client-role virtual connection, which
+        // reuses the REAL fd from its own Socket() call) still has a genuine
+        // real fd behind it and should still be closed for real.
+        bool is_synthetic = false;
+        {
+            std::scoped_lock lk(g_vtcp_mutex);
+            VTcpConn *c = FindVTcpConnByFd(fd);
+            if (c != nullptr) {
+                is_synthetic = (c->fd >= 1000);
+                if (c->established) {
+                    SendTcpSegment(m_bridged_local_ip, c->peer_ip, LdnControlPort, c->peer_port,
+                        c->our_seq, c->their_seq, TCP_FIN | TCP_ACK, nullptr, 0);
+                }
+                LogFormat("BsdBridge: Close(tcp fd=%d) -- tearing down connection to 0x%08x:%u",
+                    fd, c->peer_ip, c->peer_port);
+                *c = VTcpConn{};
+            }
+            if (fd == g_tcp_listen_fd) {
+                g_tcp_listen_fd = -1;
+                LogFormat("BsdBridge: Close(fd=%d) -- was the virtual TCP listener", fd);
+            }
+        }
+
+        if (is_synthetic) {
+            UntrackFd(fd);
+            out_ret.SetValue(0);
+            out_errno.SetValue(0);
+            return ResultSuccess();
+        }
+
+        struct { s32 fd; } in = { fd };
+        RetErrno out{};
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 26, in, out);
+        out_ret.SetValue(out.ret);
+        out_errno.SetValue(out.err);
+        UntrackFd(fd);
+        if (IsBridged(fd)) {
+            LogFormat("BsdBridge: Close(fd=%d) -- unbridging (was the relay-bridged socket)", fd);
+            m_bridged_fd = -1;
+            m_bridged_local_ip = 0;
+
+            // Tear down the relay connection too, not just the local bridged
+            // fd. g_relay is a process-wide singleton, only ever opened
+            // lazily -- without this it outlives the LDN session entirely,
+            // so a stale/dead connection (relay restarted, PC slept and its
+            // NAT mapping expired, etc.) gets silently REUSED by the next
+            // game's session instead of reconnecting fresh, leaving
+            // "connected" stuck in the overlay and every subsequent join
+            // failing with a communication error until a full reboot.
+            // Closing here means the next EnsureRelayConnected() (from
+            // whatever LDN session comes next) always dials a brand new
+            // connection.
+            std::scoped_lock relay_lk(g_relay_mutex);
+            g_relay.Close();
+            g_relay_connect_attempted = false;
+            g_last_bridged_local_ip = 0;
+            g_last_bridge_activity_ms.store(0, std::memory_order_relaxed);
+        }
+        return rc;
+    }
+
+    // ---- remaining generic forwards -----------------------------------------
+
+    Result BsdBridgeService::Send(sf::Out<s32> out_size, sf::Out<s32> out_errno, s32 fd, s32 flags,
+            const sf::InAutoSelectBuffer &buffer) {
+        struct { s32 fd, flags; } in = { fd, flags };
+        RetErrno out{};
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 10, in, out,
+            .buffer_attrs = { SfBufferAttr_In | SfBufferAttr_HipcAutoSelect },
+            .buffers = { { buffer.GetPointer(), buffer.GetSize() } });
+        out_size.SetValue(out.ret);
+        out_errno.SetValue(out.err);
+        return rc;
+    }
+
+    Result BsdBridgeService::Accept(sf::Out<s32> out_fd, sf::Out<s32> out_errno, sf::Out<u32> out_addrlen, s32 fd, sf::OutAutoSelectBuffer addr_out) {
+        // Host role: ldn_mitm's real accept() on its (never actually bound to
+        // anything real) TCP listener would just fail forever, since nothing
+        // reaches the real local network for this project. Answer it
+        // ourselves instead -- the SYN-ACK and handshake tracking already
+        // happened in DrainRelay/HandleTcpSegment (matching a real kernel's
+        // TCP stack: accept() only ever DEQUEUES an already-handshaked
+        // connection, it doesn't drive the handshake), so this just needs to
+        // find a got_final_ack pending accept and turn it into a real fd.
+        if (fd == g_tcp_listen_fd) {
+            DrainRelay();
+            std::scoped_lock lk(g_vtcp_mutex);
+            for (auto &p : g_pending_accepts) {
+                if (!p.used || !p.got_final_ack) continue;
+                VTcpConn *c = AllocVTcpConn();
+                if (c == nullptr) {
+                    // No free slot (StationCountMax-ish limit reached) -- leave
+                    // it pending; matches ldn_mitm's own "no free station"
+                    // rejection (LANDiscovery::onConnect), just deferred
+                    // instead of immediately closing.
+                    continue;
+                }
+                p.used = false;
+                c->fd = g_next_synthetic_fd++;
+                c->established = true;
+                c->peer_ip = p.peer_ip;
+                c->peer_port = p.peer_port;
+                c->our_seq = p.our_isn + 1;
+                c->their_seq = p.their_isn + 1;
+                TrackFd(c->fd, SOCK_STREAM);
+
+                struct sockaddr_in peer_sin{};
+                peer_sin.sin_family = AF_INET;
+                peer_sin.sin_port = htons(c->peer_port);
+                peer_sin.sin_addr.s_addr = htonl(c->peer_ip);
+                size_t addrlen = (addr_out.GetSize() < sizeof(peer_sin)) ? addr_out.GetSize() : sizeof(peer_sin);
+                std::memcpy(addr_out.GetPointer(), &peer_sin, addrlen);
+
+                LogFormat("BsdBridge: Accept(tcp listener fd=%d) -> new fd=%d peer=0x%08x:%u",
+                    fd, c->fd, c->peer_ip, c->peer_port);
+                out_fd.SetValue(c->fd);
+                out_errno.SetValue(0);
+                out_addrlen.SetValue(static_cast<u32>(addrlen));
+                return ResultSuccess();
+            }
+            out_fd.SetValue(-1);
+            out_errno.SetValue(EWOULDBLOCK);
+            out_addrlen.SetValue(0);
+            return ResultSuccess();
+        }
+
+        struct { s32 fd; } in = { fd };
+        struct { s32 ret; s32 err; u32 addrlen; } out{};
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 12, in, out,
+            .buffer_attrs = { SfBufferAttr_Out | SfBufferAttr_HipcAutoSelect },
+            .buffers = { { addr_out.GetPointer(), addr_out.GetSize() } });
+        out_fd.SetValue(out.ret);
+        out_errno.SetValue(out.err);
+        out_addrlen.SetValue(out.addrlen);
+        return rc;
+    }
+
+    Result BsdBridgeService::Connect(sf::Out<s32> out_ret, sf::Out<s32> out_errno, s32 fd, const sf::InAutoSelectBuffer &addr) {
+        if (GetTrackedType(fd) == SOCK_STREAM) {
+            // Client role: ldn_mitm's own LANDiscovery::connect()
+            // (lan_discovery.cpp) does a single synchronous ::connect() on
+            // this fd -- the LDN station channel -- to the discovered
+            // host's ipv4Address:11452. Drive a real TCP 3-way handshake
+            // (genuine SYN, real seq/ack, real checksums) over the relay and
+            // block (matching ldn_mitm's own synchronous usage -- its
+            // worker thread makes no other bsd:u calls while waiting on
+            // this one, so blocking this single dispatch thread costs no
+            // real concurrency) until it completes or we give up.
+            if (!EnsureRelayConnected()) {
+                out_ret.SetValue(-1);
+                out_errno.SetValue(EIO);
+                return ResultSuccess();
+            }
+
+            struct sockaddr_in dst_sin{};
+            if (addr.GetSize() >= sizeof(dst_sin)) {
+                std::memcpy(&dst_sin, addr.GetPointer(), sizeof(dst_sin));
+            }
+            u32 dst_ip = ntohl(dst_sin.sin_addr.s_addr);
+            u16 dst_port = ntohs(dst_sin.sin_port);
+            if (dst_port == 0) dst_port = LdnControlPort; // ldn_mitm always targets 11452; defensive fallback
+
+            u32 our_isn = 0;
+            ams::os::GenerateRandomBytes(std::addressof(our_isn), sizeof(our_isn));
+
+            {
+                std::scoped_lock lk(g_vtcp_mutex);
+                VTcpConn *c = AllocVTcpConn();
+                if (c == nullptr) {
+                    out_ret.SetValue(-1);
+                    out_errno.SetValue(ENOBUFS);
+                    return ResultSuccess();
+                }
+                c->fd = fd;
+                c->peer_ip = dst_ip;
+                c->peer_port = dst_port;
+                c->our_isn = our_isn;
+                c->syn_sent_awaiting_synack = true;
+            }
+
+            LogFormat("BsdBridge: Connect(tcp fd=%d) -> dst 0x%08x:%u isn=%u, sending SYN",
+                fd, dst_ip, dst_port, our_isn);
+
+            // Retry the SYN a few times in case the first is dropped by the
+            // relay's own unreliable UDP transport (see relay_bridge.hpp);
+            // ~3s total before giving up, comfortably under however long the
+            // game itself waits for a failed join. The final ACK completing
+            // the handshake is sent by HandleTcpSegment as soon as it sees
+            // the SYN-ACK (it has g_last_bridged_local_ip available), not
+            // here -- this loop just waits for `established` to flip.
+            constexpr int MaxAttempts = 6;
+            constexpr int RetryIntervalMs = 500;
+            bool established = false;
+            for (int attempt = 0; attempt < MaxAttempts && !established; attempt++) {
+                SendTcpSegment(m_bridged_local_ip, dst_ip, LdnControlPort, dst_port,
+                    our_isn, 0, TCP_SYN, nullptr, 0);
+                for (int waited = 0; waited < RetryIntervalMs; waited += 20) {
+                    os::SleepThread(TimeSpan::FromMilliSeconds(20));
+                    DrainRelay();
+                    std::scoped_lock lk(g_vtcp_mutex);
+                    VTcpConn *c = FindVTcpConnByFd(fd);
+                    if (c != nullptr && c->established) { established = true; break; }
+                }
+            }
+
+            if (!established) {
+                std::scoped_lock lk(g_vtcp_mutex);
+                VTcpConn *c = FindVTcpConnByFd(fd);
+                if (c != nullptr) *c = VTcpConn{};
+                LogFormat("BsdBridge: Connect(tcp fd=%d) -> TIMED OUT waiting for SYN-ACK", fd);
+                out_ret.SetValue(-1);
+                out_errno.SetValue(ETIMEDOUT);
+                return ResultSuccess();
+            }
+
+            LogFormat("BsdBridge: Connect(tcp fd=%d) -> established with 0x%08x:%u", fd, dst_ip, dst_port);
+            out_ret.SetValue(0);
+            out_errno.SetValue(0);
+            return ResultSuccess();
+        }
+
+        struct { s32 fd; } in = { fd };
+        RetErrno out{};
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 14, in, out,
+            .buffer_attrs = { SfBufferAttr_In | SfBufferAttr_HipcAutoSelect },
+            .buffers = { { addr.GetPointer(), addr.GetSize() } });
+        out_ret.SetValue(out.ret);
+        out_errno.SetValue(out.err);
+        return rc;
+    }
+
+    Result BsdBridgeService::GetPeerName(sf::Out<s32> out_ret, sf::Out<s32> out_errno, sf::Out<u32> out_addrlen, s32 fd, sf::OutAutoSelectBuffer addr_out) {
+        struct { s32 fd; } in = { fd };
+        struct { s32 ret; s32 err; u32 addrlen; } out{};
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 15, in, out,
+            .buffer_attrs = { SfBufferAttr_Out | SfBufferAttr_HipcAutoSelect },
+            .buffers = { { addr_out.GetPointer(), addr_out.GetSize() } });
+        out_ret.SetValue(out.ret);
+        out_errno.SetValue(out.err);
+        out_addrlen.SetValue(out.addrlen);
+        return rc;
+    }
+
+    Result BsdBridgeService::GetSockName(sf::Out<s32> out_ret, sf::Out<s32> out_errno, sf::Out<u32> out_addrlen, s32 fd, sf::OutAutoSelectBuffer addr_out) {
+        struct { s32 fd; } in = { fd };
+        struct { s32 ret; s32 err; u32 addrlen; } out{};
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 16, in, out,
+            .buffer_attrs = { SfBufferAttr_Out | SfBufferAttr_HipcAutoSelect },
+            .buffers = { { addr_out.GetPointer(), addr_out.GetSize() } });
+        out_ret.SetValue(out.ret);
+        out_errno.SetValue(out.err);
+        out_addrlen.SetValue(out.addrlen);
+        return rc;
+    }
+
+    Result BsdBridgeService::GetSockOpt(sf::Out<s32> out_ret, sf::Out<s32> out_errno, sf::Out<u32> out_optlen, s32 fd, s32 level, s32 optname,
+            sf::OutAutoSelectBuffer optval) {
+        struct { s32 fd, level, optname; } in = { fd, level, optname };
+        struct { s32 ret; s32 err; u32 optlen; } out{};
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 17, in, out,
+            .buffer_attrs = { SfBufferAttr_Out | SfBufferAttr_HipcAutoSelect },
+            .buffers = { { optval.GetPointer(), optval.GetSize() } });
+        out_ret.SetValue(out.ret);
+        out_errno.SetValue(out.err);
+        out_optlen.SetValue(out.optlen);
+        return rc;
+    }
+
+    Result BsdBridgeService::Listen(sf::Out<s32> out_ret, sf::Out<s32> out_errno, s32 fd, s32 backlog) {
+        struct { s32 fd, backlog; } in = { fd, backlog };
+        RetErrno out{};
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 18, in, out);
+        out_ret.SetValue(out.ret);
+        out_errno.SetValue(out.err);
+
+        // Host role: this is ldn_mitm's LDN station listener (initTcp(true)
+        // in the real source, bound to LdnControlPort). Mark it so Accept/
+        // Poll answer from the virtual-TCP tunnel instead of the real
+        // (never actually reachable) local listener the forward above just
+        // harmlessly set up.
+        if (GetTrackedType(fd) == SOCK_STREAM) {
+            std::scoped_lock lk(g_vtcp_mutex);
+            g_tcp_listen_fd = fd;
+            LogFormat("BsdBridge: Listen(fd=%d) -- marked as the virtual TCP listener", fd);
+        }
+        return rc;
+    }
+
+    Result BsdBridgeService::Ioctl(sf::Out<s32> out_result, sf::Out<s32> out_errno, s32 fd, u32 request, u32 bufcount,
+            const sf::InAutoSelectBuffer &buf_in1, const sf::InAutoSelectBuffer &buf_in2,
+            const sf::InAutoSelectBuffer &buf_in3, const sf::InAutoSelectBuffer &buf_in4,
+            sf::OutAutoSelectBuffer buf_out1, sf::OutAutoSelectBuffer buf_out2,
+            sf::OutAutoSelectBuffer buf_out3, sf::OutAutoSelectBuffer buf_out4) {
+        struct { s32 fd; u32 request, bufcount; } in = { fd, request, bufcount };
+        RetErrno out{};
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 19, in, out,
+            .buffer_attrs = {
+                SfBufferAttr_In | SfBufferAttr_HipcAutoSelect, SfBufferAttr_In | SfBufferAttr_HipcAutoSelect,
+                SfBufferAttr_In | SfBufferAttr_HipcAutoSelect, SfBufferAttr_In | SfBufferAttr_HipcAutoSelect,
+                SfBufferAttr_Out | SfBufferAttr_HipcAutoSelect, SfBufferAttr_Out | SfBufferAttr_HipcAutoSelect,
+                SfBufferAttr_Out | SfBufferAttr_HipcAutoSelect, SfBufferAttr_Out | SfBufferAttr_HipcAutoSelect },
+            .buffers = {
+                { buf_in1.GetPointer(), buf_in1.GetSize() }, { buf_in2.GetPointer(), buf_in2.GetSize() },
+                { buf_in3.GetPointer(), buf_in3.GetSize() }, { buf_in4.GetPointer(), buf_in4.GetSize() },
+                { buf_out1.GetPointer(), buf_out1.GetSize() }, { buf_out2.GetPointer(), buf_out2.GetSize() },
+                { buf_out3.GetPointer(), buf_out3.GetSize() }, { buf_out4.GetPointer(), buf_out4.GetSize() } });
+        out_result.SetValue(out.ret);
+        out_errno.SetValue(out.err);
+        return rc;
+    }
+
+    Result BsdBridgeService::Fcntl(sf::Out<s32> out_result, sf::Out<s32> out_errno, s32 fd, s32 cmd, s32 arg) {
+        struct { s32 fd, cmd, arg; } in = { fd, cmd, arg };
+        RetErrno out{};
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 20, in, out);
+        out_result.SetValue(out.ret);
+        out_errno.SetValue(out.err);
+        return rc;
+    }
+
+    Result BsdBridgeService::SetSockOpt(sf::Out<s32> out_ret, sf::Out<s32> out_errno, s32 fd, s32 level, s32 optname,
+            const sf::InAutoSelectBuffer &optval) {
+        struct { s32 fd, level, optname; } in = { fd, level, optname };
+        RetErrno out{};
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 21, in, out,
+            .buffer_attrs = { SfBufferAttr_In | SfBufferAttr_HipcAutoSelect },
+            .buffers = { { optval.GetPointer(), optval.GetSize() } });
+        out_ret.SetValue(out.ret);
+        out_errno.SetValue(out.err);
+        return rc;
+    }
+
+    Result BsdBridgeService::Shutdown(sf::Out<s32> out_ret, sf::Out<s32> out_errno, s32 fd, s32 how) {
+        struct { s32 fd, how; } in = { fd, how };
+        RetErrno out{};
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 22, in, out);
+        out_ret.SetValue(out.ret);
+        out_errno.SetValue(out.err);
+        return rc;
+    }
+
+    // Real bsdShutdownAllSockets(int how) (libnx bsd.c) sends only `how` --
+    // no pid; the previous {pid,how} input here didn't match what ldn_mitm's
+    // real client ever puts on the wire for this command.
+    Result BsdBridgeService::ShutdownAllSockets(sf::Out<s32> out_ret, sf::Out<s32> out_errno, s32 how) {
+        struct { s32 how; } in = { how };
+        RetErrno out{};
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 23, in, out);
+        out_ret.SetValue(out.ret);
+        out_errno.SetValue(out.err);
+        return rc;
+    }
+
+    Result BsdBridgeService::Write(sf::Out<s32> out_size, sf::Out<s32> out_errno, s32 fd, const sf::InAutoSelectBuffer &buffer) {
+        struct { s32 fd; } in = { fd };
+        RetErrno out{};
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 24, in, out,
+            .buffer_attrs = { SfBufferAttr_In | SfBufferAttr_HipcAutoSelect },
+            .buffers = { { buffer.GetPointer(), buffer.GetSize() } });
+        out_size.SetValue(out.ret);
+        out_errno.SetValue(out.err);
+        return rc;
+    }
+
+    Result BsdBridgeService::Read(sf::Out<s32> out_size, sf::Out<s32> out_errno, s32 fd, sf::OutAutoSelectBuffer buffer) {
+        struct { s32 fd; } in = { fd };
+        RetErrno out{};
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 25, in, out,
+            .buffer_attrs = { SfBufferAttr_Out | SfBufferAttr_HipcAutoSelect },
+            .buffers = { { buffer.GetPointer(), buffer.GetSize() } });
+        out_size.SetValue(out.ret);
+        out_errno.SetValue(out.err);
+        return rc;
+    }
+
+    Result BsdBridgeService::DuplicateSocket(sf::Out<s32> out_fd, sf::Out<s32> out_errno, s32 fd, u64 target_pid) {
+        struct { s32 fd; u64 target_pid; } in = { fd, target_pid };
+        RetErrno out{};
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 27, in, out);
+        out_fd.SetValue(out.ret);
+        out_errno.SetValue(out.err);
+        return rc;
+    }
+
+    Result BsdBridgeService::GetResourceStatistics(sf::Out<s32> out_errno, sf::OutBuffer out_stats, u64 pid) {
+        s32 err = 0;
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 28, pid, err,
+            .buffer_attrs = { SfBufferAttr_Out | SfBufferAttr_HipcMapAlias },
+            .buffers = { { out_stats.GetPointer(), out_stats.GetSize() } });
+        out_errno.SetValue(err);
+        return rc;
+    }
+
+    Result BsdBridgeService::RecvMMsg(sf::Out<s32> out_count, sf::Out<s32> out_errno, s32 fd, s32 vlen, s32 flags,
+            s32 timeout, sf::OutAutoSelectBuffer out_data) {
+        struct { s32 fd, vlen, flags, timeout; } in = { fd, vlen, flags, timeout };
+        RetErrno out{};
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 29, in, out,
+            .buffer_attrs = { SfBufferAttr_Out | SfBufferAttr_HipcAutoSelect },
+            .buffers = { { out_data.GetPointer(), out_data.GetSize() } });
+        out_count.SetValue(out.ret);
+        out_errno.SetValue(out.err);
+        return rc;
+    }
+
+    Result BsdBridgeService::SendMMsg(sf::Out<s32> out_count, sf::Out<s32> out_errno, s32 fd, s32 vlen, s32 flags,
+            const sf::InAutoSelectBuffer &in_data) {
+        struct { s32 fd, vlen, flags; } in = { fd, vlen, flags };
+        RetErrno out{};
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 30, in, out,
+            .buffer_attrs = { SfBufferAttr_In | SfBufferAttr_HipcAutoSelect },
+            .buffers = { { in_data.GetPointer(), in_data.GetSize() } });
+        out_count.SetValue(out.ret);
+        out_errno.SetValue(out.err);
+        return rc;
+    }
+
+    Result BsdBridgeService::EventFd(sf::Out<s32> out_fd, sf::Out<s32> out_errno, u64 initval, s32 flags) {
+        struct { u64 initval; s32 flags; } in = { initval, flags };
+        RetErrno out{};
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 31, in, out);
+        out_fd.SetValue(out.ret);
+        out_errno.SetValue(out.err);
+        return rc;
+    }
+
+    Result BsdBridgeService::RegisterResourceStatisticsName(sf::Out<s32> out_errno, u64 pid, const sf::InBuffer &name) {
+        s32 err = 0;
+        Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 32, pid, err,
+            .buffer_attrs = { SfBufferAttr_In | SfBufferAttr_HipcMapAlias },
+            .buffers = { { name.GetPointer(), name.GetSize() } });
+        out_errno.SetValue(err);
+        return rc;
+    }
+}

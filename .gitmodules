@@ -1,0 +1,6 @@
+[submodule "Atmosphere-libs"]
+	path = Atmosphere-libs
+	url = https://github.com/nx-mod/atmosphere-libs.git
+[submodule "libtesla"]
+	path = libtesla
+	url = https://github.com/nx-mod/tesla-lib.git
