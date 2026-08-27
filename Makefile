@@ -7,7 +7,7 @@
 # itself is never modified; it keeps thinking it's talking on a real local
 # network. See source/main.cpp for the ShouldMitm targeting logic.
 #---------------------------------------------------------------------------------
-include $(dir $(abspath $(lastword $(MAKEFILE_LIST))))/Atmosphere-libs/config/templates/stratosphere.mk
+include $(dir $(abspath $(lastword $(MAKEFILE_LIST))))/../atmosphere-libs/config/templates/stratosphere.mk
 
 INCLUDES     += source
 

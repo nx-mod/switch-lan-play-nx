@@ -20,7 +20,7 @@ TARGET		:=	$(notdir $(CURDIR))
 BUILD		:=	build
 SOURCES		:=	source
 DATA		:=	data
-INCLUDES	:=	include ../libtesla/include
+INCLUDES	:=	include ../../tesla-lib/include
 
 NO_ICON		:=  1
 
