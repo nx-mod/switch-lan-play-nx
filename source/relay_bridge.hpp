@@ -18,7 +18,7 @@ extern "C" {
  * transport:
  *
  *   frame = [u8 type][payload]
- *     type 0x00 KEEPALIVE  -- empty, sent every 10s
+ *     type 0x00 KEEPALIVE  -- empty, sent every KEEPALIVE_INTERVAL_MS
  *     type 0x01 IPV4       -- payload is a raw IPv4 packet, unmodified
  *     type 0x02 PING       -- 4-byte tag echoed back (not used by this
  *                              bridge yet; kept for future liveness checks)
@@ -56,6 +56,18 @@ namespace ams::slp {
     constexpr u32 KEEPALIVE_INTERVAL_MS = 2000; // the relay's own dashboard
         // drops a peer's room listing well before 10s -- 2s keeps a room
         // listed continuously.
+
+    // Fixed local source port for the relay socket. Every LDN session
+    // start/stop (a game re-entering the online menu, etc.) tears down and
+    // recreates this socket -- see BsdBridgeService::Close()'s
+    // g_relay.Close(). Without a fixed local port, each recreation gets a
+    // new ephemeral port, which most NATs then map to a NEW external
+    // port -- the relay sees that as a brand new client rather than the
+    // same one reconnecting, which is what caused a peer's room/player
+    // count on the relay's dashboard to flap on every reconnect. Binding
+    // to the same local port each time keeps the NAT mapping (and so the
+    // relay-visible identity) stable across reconnects for most NAT types.
+    constexpr u16 RELAY_LOCAL_PORT = 45454;
 
     // Frag header, network-byte-order fields.
     struct FragHeader {
@@ -206,6 +218,17 @@ namespace ams::slp {
                 if (m_fd < 0) {
                     return MAKERESULT(Module_Libnx, LibnxError_IoError);
                 }
+
+                // Best-effort: if this fails (port already in use somehow),
+                // fall through and let the OS assign an ephemeral port on
+                // first send instead, same as before this existed.
+                int reuse = 1;
+                setsockopt(m_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+                struct sockaddr_in local_addr{};
+                local_addr.sin_family = AF_INET;
+                local_addr.sin_addr.s_addr = INADDR_ANY;
+                local_addr.sin_port = htons(RELAY_LOCAL_PORT);
+                bind(m_fd, reinterpret_cast<struct sockaddr *>(&local_addr), sizeof(local_addr));
 
                 int flags = fcntl(m_fd, F_GETFL, 0);
                 if (flags != -1) {
