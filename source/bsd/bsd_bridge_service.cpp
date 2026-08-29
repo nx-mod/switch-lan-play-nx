@@ -36,6 +36,28 @@ namespace ams::mitm::bsd {
         // console is presenting as. 0 = no bridged session active right now.
         u32 g_last_bridged_local_ip = 0;
 
+        // How many bridged sockets are currently open, summed across EVERY
+        // process's own BsdBridgeService instance -- not just one anymore,
+        // since ldn_mitm's own control channel and a game's own separate
+        // gameplay socket can both be bridged at the same time now (see
+        // this file's own header comment). g_relay is a single global
+        // singleton tunnel shared by all of them; Close() below must only
+        // tear it down once the LAST bridged socket goes away, not the
+        // first one -- otherwise a game closing its own socket (e.g.
+        // between rounds) would yank the relay out from under ldn_mitm's
+        // still-active session too.
+        int g_bridged_socket_count = 0;
+
+        // The single instance (there is only ever one real ldn_mitm process)
+        // currently bound to LdnControlPort -- lets the background drain
+        // thread keep driving retransmit-checking/TCP-segment processing at
+        // high frequency (5ms) without needing a full instance registry,
+        // without reintroducing the cross-process collision bug: this is
+        // only ever set by Bind() when a socket was verified to actually
+        // bind LdnControlPort, never by an arbitrary other mitm'd process.
+        // nullptr = no LDN control channel bridged right now.
+        BsdBridgeService *g_active_ldn_instance = nullptr;
+
         // Guards g_relay/g_relay_connect_attempted/g_socket_stack_ready/
         // g_relay_enabled/g_last_bridged_local_ip.
         // Added alongside slpnx:cfg's Reconnect command (cfg/cfg_service.cpp):
@@ -84,6 +106,7 @@ namespace ams::mitm::bsd {
                 g_relay.Close();
                 g_relay_connect_attempted = false;
                 g_last_bridged_local_ip = 0;
+                g_bridged_socket_count = 0; // relay's gone regardless of what any still-live instance's own m_bridged_fd thinks
                 g_last_bridge_activity_ms.store(0, std::memory_order_relaxed);
             }
         }
@@ -100,6 +123,74 @@ namespace ams::mitm::bsd {
             if (R_FAILED(rc)) return;
             ams::os::SetThreadNamePointer(std::addressof(g_watchdog_thread), "BsdBridge::Watchdog");
             ams::os::StartThread(std::addressof(g_watchdog_thread));
+        }
+
+        // Drain pump: DrainRelay() (defined further down) used to run ONLY
+        // when ldn_mitm itself called a bsd:u command that touches the relay
+        // (RecvFrom/Poll/Select/Accept/Connect) -- observed in practice to be
+        // every 100-400ms, gated entirely by ldn_mitm's own worker loop
+        // cadence. That's dead time added on top of real relay latency, on
+        // BOTH consoles, in BOTH directions of a join. ldn_mitm's own
+        // LANDiscovery::connect() (lan_discovery.cpp) gives the whole
+        // Connect-packet-out -> SyncNetwork-reply-in exchange a single flat
+        // 1-second sleep with no retry -- unmodifiable (this project has to
+        // sit under a completely stock ldn_mitm, that's the whole point of
+        // the mitm approach) -- so every millisecond spent merely waiting
+        // for ldn_mitm to get around to polling is a millisecond stolen from
+        // that fixed budget.
+        //
+        // The original PC client this project ports (switch-lan-play/src,
+        // uv_lwip/) never had this problem: it's a libuv event loop wired
+        // through a full lwip TCP/IP stack, so packets are processed the
+        // instant they arrive, not on whatever cadence a caller happens to
+        // poll at. This thread is the Switch-native equivalent -- draining
+        // the relay continuously instead of only when ldn_mitm asks.
+        bool g_drain_thread_started = false;
+        constexpr size_t DrainThreadStackSize = 0x2000;
+        alignas(ams::os::MemoryPageSize) u8 g_drain_thread_stack[DrainThreadStackSize];
+        ams::os::ThreadType g_drain_thread;
+
+        void DrainRawRelayQueue(); // defined below -- needed here since this thread predates it in file order
+
+        void DrainThreadMain(void *) {
+            while (true) {
+                DrainRawRelayQueue(); // instance-agnostic: files raw relay traffic into the shared, port-tagged queues
+
+                // Drive the one real ldn_mitm instance's own retransmit
+                // checking + TCP-segment processing at this same tight
+                // cadence too, same as before this was split apart -- see
+                // g_active_ldn_instance's own comment. Deliberately does NOT
+                // hold g_relay_mutex across the DrainRelay() call itself:
+                // DrainRelay() (and SendTo()'s TCP branch, elsewhere in this
+                // file) acquires g_vtcp_mutex and, from there, can still
+                // need g_relay_mutex (EnsureRelayConnected) -- holding
+                // g_relay_mutex HERE while calling into something that takes
+                // g_vtcp_mutex would invert that existing lock order against
+                // a different thread doing vtcp-then-relay, a real deadlock.
+                // Copy the pointer under the lock, release, then use it.
+                BsdBridgeService *active;
+                {
+                    std::scoped_lock lk(g_relay_mutex);
+                    active = g_active_ldn_instance;
+                }
+                if (active != nullptr) active->DrainRelay();
+
+                ams::os::SleepThread(ams::TimeSpan::FromMilliSeconds(5));
+            }
+        }
+
+        void EnsureDrainThreadStarted() {
+            if (g_drain_thread_started) return;
+            g_drain_thread_started = true;
+            // Same priority tier as RelayBridge's own pump thread
+            // (relay_bridge.hpp PumpThreadPriority) -- this thread is
+            // downstream of that one (it consumes what the pump already
+            // queued) and needs to run just as promptly.
+            Result rc = ams::os::CreateThread(std::addressof(g_drain_thread), DrainThreadMain, nullptr,
+                g_drain_thread_stack, sizeof(g_drain_thread_stack), 6);
+            if (R_FAILED(rc)) return;
+            ams::os::SetThreadNamePointer(std::addressof(g_drain_thread), "BsdBridge::Drain");
+            ams::os::StartThread(std::addressof(g_drain_thread));
         }
 
         // Host/port come from slpnx::cfg::RuntimeCfg (cfg/runtime_cfg.hpp),
@@ -166,49 +257,11 @@ namespace ams::mitm::bsd {
                 static_cast<void *>(g_socket_tmem_buffer), sizeof(g_socket_tmem_buffer));
         }
 
-        // ---- fd type tracking ----------------------------------------------
-        // Bind alone can't tell SOCK_DGRAM from SOCK_STREAM, and ldn_mitm
-        // binds BOTH its UDP control socket and its TCP station listener to
-        // the same DefaultPort 11452 (lan_discovery.cpp initTcp/initUdp).
-        // Bind()'s is_udp check (below) needs this to route each fd to the
-        // right virtualization path.
-        constexpr size_t MaxTrackedFds = 16;
-
-        // Plain C arrays are zero-initialized by C++'s static-storage-duration
-        // rules, not filled with -1 -- both arrays must be seeded explicitly
-        // or "-1 means unused" isn't actually true at startup, and TrackFd's
-        // "find an empty slot" scan never matches anything.
-        constexpr std::array<s32, MaxTrackedFds> MakeUnsetFdArray() {
-            std::array<s32, MaxTrackedFds> a{};
-            for (auto &v : a) { v = -1; }
-            return a;
-        }
-        std::array<s32, MaxTrackedFds> g_tracked_fd = MakeUnsetFdArray();
-        std::array<s32, MaxTrackedFds> g_tracked_type = MakeUnsetFdArray();
-
-        void TrackFd(s32 fd, s32 type) {
-            if (fd < 0) return;
-            for (size_t i = 0; i < MaxTrackedFds; i++) {
-                if (g_tracked_fd[i] == -1 || g_tracked_fd[i] == fd) {
-                    g_tracked_fd[i] = fd;
-                    g_tracked_type[i] = type;
-                    return;
-                }
-            }
-        }
-
-        void UntrackFd(s32 fd) {
-            for (size_t i = 0; i < MaxTrackedFds; i++) {
-                if (g_tracked_fd[i] == fd) g_tracked_fd[i] = -1;
-            }
-        }
-
-        s32 GetTrackedType(s32 fd) {
-            for (size_t i = 0; i < MaxTrackedFds; i++) {
-                if (g_tracked_fd[i] == fd) return g_tracked_type[i];
-            }
-            return -1;
-        }
+        // fd-type tracking (TrackFd/UntrackFd/GetTrackedType) and the vtcp
+        // connection helpers (FindVTcpConnByFd/ByPeer/AllocVTcpConn) are now
+        // BsdBridgeService instance methods (defined near the class's other
+        // methods further down) instead of free functions over globals --
+        // see the header's own comment on why (per-process fd isolation).
 
         // Mirrors BsdBridgeService::LdnControlPort (private class member, not
         // reachable from these free functions) -- same value, ldn_mitm's own
@@ -237,18 +290,58 @@ namespace ams::mitm::bsd {
             return true;
         }
 
-        // Small FIFO the control channel (UDP, LdnControlPort) actually reads
-        // from -- DrainRelay is the ONLY caller of GetRelay().PopIpv4(), so
-        // control-channel packets get sorted in here instead of RecvFrom
-        // popping the shared relay queue directly (which would risk handing a
-        // TCP segment to the control-channel parser). Same capacity as
-        // RelayBridge's own QueueSize; LDN control traffic is light so this
-        // is generous headroom, not a tight budget.
+        // Small buffer every bridged UDP socket's incoming packets pass
+        // through -- DrainRelay is the ONLY caller of GetRelay().PopIpv4(),
+        // so UDP packets get sorted in here instead of RecvFrom popping the
+        // shared relay queue directly (which would risk handing a TCP
+        // segment to the UDP-side parser). Same capacity as RelayBridge's
+        // own QueueSize.
+        //
+        // SHARED across every bridged process's UDP socket, not just
+        // ldn_mitm's own control channel -- a game's own gameplay socket
+        // (different process, different port, same relay tunnel) files in
+        // here too now. dst_port is what lets each process's own RecvFrom
+        // (bsd_bridge_service.cpp) pick out only the entries meant for ITS
+        // OWN bound port, leaving everyone else's where they are. A plain
+        // dense array + linear scan (not a ring buffer) because "remove one
+        // arbitrary matching entry, not just the head" is now the normal
+        // access pattern, and ControlQueueSize is small enough that O(n)
+        // scan+compact costs nothing real.
+        // Real ldn_mitm LAN payloads (and a game's own UDP gameplay
+        // payloads, now that Bind() bridges those too) can be up to
+        // LanSocket::BufferSize -- 2048, matching VTcpInboxCap (header) --
+        // not RELAY_MTU (1400), which is the wire FRAGMENT size, not a
+        // payload cap: relay_bridge.hpp already transparently fragments/
+        // reassembles anything bigger via SendFragmented/ReassembleFrag.
+        // Every local buffer in this file used to be sized to exactly
+        // RELAY_MTU, which meant SendTcpSegment/SendTo silently failed
+        // (return -1 / EMSGSIZE) for any real payload over ~1360-1372
+        // bytes instead of ever reaching that fragmentation path --
+        // confirmed as a real bug, independently hit and fixed in a
+        // sibling project (ldn_mitm-dogty: "fragment full-MTU game
+        // datagrams instead of dropping them").
+        constexpr size_t MaxBridgedPayload = VTcpInboxCap;
+
         constexpr size_t ControlQueueSize = 32;
-        struct ControlPacket { size_t len; u8 data[20 + 8 + slp::RELAY_MTU]; };
+        struct ControlPacket { size_t len; u16 dst_port; u8 data[20 + 8 + MaxBridgedPayload]; };
         ControlPacket g_control_queue[ControlQueueSize];
-        size_t g_control_head = 0, g_control_count = 0;
+        size_t g_control_count = 0;
         ams::os::SdkMutex g_control_queue_mutex;
+
+        // Pulls the first queued packet whose dst_port matches, compacting
+        // the rest down. Caller must hold g_control_queue_mutex.
+        bool PopControlPacketForPort(u16 port, ControlPacket &out) {
+            for (size_t i = 0; i < g_control_count; i++) {
+                if (g_control_queue[i].dst_port != port) continue;
+                out = g_control_queue[i];
+                for (size_t j = i + 1; j < g_control_count; j++) {
+                    g_control_queue[j - 1] = g_control_queue[j];
+                }
+                g_control_count--;
+                return true;
+            }
+            return false;
+        }
 
         // ---- real TCP tunnel -------------------------------------------------
         // Bridges ldn_mitm's OTHER socket: the LDN "station" TCP connection
@@ -282,78 +375,21 @@ namespace ams::mitm::bsd {
         // for this socket).
         constexpr u8 TCP_FIN = 0x01, TCP_SYN = 0x02, TCP_RST = 0x04, TCP_PSH = 0x08, TCP_ACK = 0x10;
 
-        constexpr size_t VTcpInboxCap = 2048; // one compressed LAN packet is at most LanSocket::BufferSize (2048) in ldn_mitm's own source
-
-        // A connection accepted or in progress -- accepted (host role) gets a
-        // SYNTHETIC fd (see AllocVTcpConn's caller in Accept below); our own
-        // outbound Connect() reuses the REAL fd from its own Socket() call.
-        struct VTcpConn {
-            bool used = false;
-            s32 fd = -1;
-            bool established = false;              // full 3-way handshake done, data may flow
-            bool syn_sent_awaiting_synack = false;  // client role: Connect() sent SYN, waiting
-            u32 peer_ip = 0;                        // host order
-            u16 peer_port = 0;
-            u32 our_isn = 0;   // recorded at SYN time (client role) to validate the SYN-ACK's ack field
-            u32 our_seq = 0;   // next byte WE will send
-            u32 their_seq = 0; // next byte WE expect (the value we put in our own ack field)
-            u8 inbox[VTcpInboxCap];
-            size_t inbox_len = 0;
-            bool inbox_ready = false;
-            bool peer_closed = false;
-        };
-        // 1 client-role connection, or up to StationCountMax(8, ldn_mitm's own
-        // constant) host-role accepted stations -- ldn_mitm only ever plays
-        // ONE role per session, so this covers either case with room to spare.
-        constexpr int MaxVTcpConns = 9;
+        // VTcpConn/PendingAccept/MaxVTcpConns/MaxPendingAccepts/VTcpInboxCap
+        // are declared in the header. The arrays themselves are a single
+        // shared copy here -- NOT per-instance -- see the header's own
+        // comment on BsdBridgeService for why (a per-instance copy was
+        // tried and exhausted this sysmodule's heap the moment more than a
+        // couple of processes were bridged at once). Access is gated by
+        // ownership instead: BsdBridgeService::FindVTcpConnByFd/ByPeer/
+        // AllocVTcpConn/IsOwnTcpListenFd (defined further down) all refuse
+        // to touch these unless `this == g_active_ldn_instance`.
         VTcpConn g_vtcp_conns[MaxVTcpConns];
-
-        s32 g_tcp_listen_fd = -1;   // set once ldn_mitm Bind()+Listen()s its TCP
-                                     // socket on LdnControlPort (host role)
-
-        // A SYN has arrived and been SYN-ACKed (both happen immediately in
-        // DrainRelay, matching a real kernel's TCP stack -- accept() only
-        // ever DEQUEUES an already-handshaked connection, it doesn't drive
-        // the handshake itself) but the final client ACK hasn't arrived yet.
-        struct PendingAccept {
-            bool used = false;
-            u32 peer_ip = 0;
-            u16 peer_port = 0;
-            u32 our_isn = 0;
-            u32 their_isn = 0;
-            bool got_final_ack = false; // true once ready for Accept() to dequeue
-        };
-        constexpr int MaxPendingAccepts = 8;
+        s32 g_tcp_listen_fd = -1; // set once the owning instance Bind()+Listen()s its TCP socket on LdnControlPort (host role)
         PendingAccept g_pending_accepts[MaxPendingAccepts];
-
-        s32 g_next_synthetic_fd = 1000; // real bsd:u fds never reach this high
-                                          // in this narrow use case (a handful
-                                          // of sockets total per ldn_mitm session)
+        s32 g_next_synthetic_fd = 1000; // real bsd:u fds never reach this high in this narrow use case
 
         ams::os::SdkMutex g_vtcp_mutex; // guards everything above
-
-        VTcpConn *FindVTcpConnByFd(s32 fd) {
-            for (auto &c : g_vtcp_conns) { if (c.used && c.fd == fd) return &c; }
-            return nullptr;
-        }
-        // Matches by peer IP alone: ldn_mitm always uses port 11452 for both
-        // sides of this channel, so a peer's IP alone is enough to tell its
-        // one connection apart from every other peer's (host role can have
-        // several stations, one per distinct console/peer IP).
-        VTcpConn *FindVTcpConnByPeer(u32 peer_ip) {
-            for (auto &c : g_vtcp_conns) { if (c.used && c.peer_ip == peer_ip) return &c; }
-            return nullptr;
-        }
-        VTcpConn *AllocVTcpConn() {
-            for (auto &c : g_vtcp_conns) {
-                if (!c.used) {
-                    c = VTcpConn{};
-                    c.used = true;
-                    return &c;
-                }
-            }
-            return nullptr;
-        }
 
         // Same idea, for a real IPv4/TCP segment.
         bool ParseIpv4Tcp(const u8 *pkt, size_t pkt_len, u32 &out_src_ip, u16 &out_src_port, u16 &out_dst_port,
@@ -399,10 +435,47 @@ namespace ams::mitm::bsd {
             return static_cast<u16>(~sum);
         }
 
+        // Read-only, best-effort LDN packet recognition for diagnostics only
+        // -- never used to make any routing/retransmit decision, so a
+        // malformed/unrecognized header just logs nothing rather than
+        // failing anything. Mirrors ldn_mitm's own LANPacketHeader (source/
+        // lan_protocol.hpp): magic(u32) + type(u8) + compressed(u8) +
+        // length(u16) + decompress_length(u16) + reserved(u8[2]) = 12 bytes,
+        // immediately followed by `length` bytes of (possibly RLE-
+        // compressed) payload. Assumes the whole header+payload lands in a
+        // single TCP segment, true for every LDN control packet observed
+        // tonight (Connect ~35B, SyncNetwork ~270-290B compressed, both well
+        // under one segment) -- a split across segments just fails the
+        // length check below and logs nothing, no different from an
+        // unrecognized packet.
+        constexpr u32 LanMagic = 0x11451400;
+        const char *LdnPacketTypeName(u8 type) {
+            switch (type) {
+                case 0: return "Scan";
+                case 1: return "ScanResp";
+                case 2: return "Connect";
+                case 3: return "SyncNetwork";
+                default: return "?";
+            }
+        }
+        void LogLdnPacketIfRecognized(const char *direction, const u8 *payload, size_t payload_len) {
+            if (payload_len < 12) return;
+            u32 magic = static_cast<u32>(payload[0]) | (static_cast<u32>(payload[1]) << 8) |
+                        (static_cast<u32>(payload[2]) << 16) | (static_cast<u32>(payload[3]) << 24);
+            if (magic != LanMagic) return;
+            u8 type = payload[4];
+            u8 compressed = payload[5];
+            u16 length = static_cast<u16>(payload[6] | (payload[7] << 8));
+            u16 decompress_length = static_cast<u16>(payload[8] | (payload[9] << 8));
+            if (12u + length > payload_len) return; // truncated/split across segments -- skip
+            LogFormat("BsdBridge: LDN %s type=%s len=%u compressed=%u decompress_len=%u",
+                direction, LdnPacketTypeName(type), length, compressed, decompress_length);
+        }
+
         // Builds and sends one raw IPv4/TCP segment via the relay.
         ssize_t SendTcpSegment(u32 src_ip, u32 dst_ip, u16 src_port, u16 dst_port,
                 u32 seq, u32 ack, u8 flags, const void *payload, size_t payload_len) {
-            u8 packet[20 + 20 + slp::RELAY_MTU];
+            u8 packet[20 + 20 + MaxBridgedPayload];
             size_t tcp_len = 20 + payload_len;
             size_t total = 20 + tcp_len;
             if (total > sizeof(packet)) return -1;
@@ -438,147 +511,70 @@ namespace ams::mitm::bsd {
             return g_relay.SendIpv4(packet, total);
         }
 
-        // Handles one already-parsed TCP segment -- factored out of DrainRelay
-        // so the segment-classification switch below can just `return`
-        // instead of juggling `continue`/`goto` inside the popping loop.
-        // Caller must hold g_vtcp_mutex.
-        void HandleTcpSegment(u32 local_ip, u32 src_ip, u16 src_port,
-                u32 seq, u32 ack, u8 flags, const u8 *payload, size_t payload_len) {
-            const bool is_syn = (flags & TCP_SYN) != 0;
-            const bool is_ack = (flags & TCP_ACK) != 0;
-            const bool is_fin = (flags & TCP_FIN) != 0;
-            const bool is_rst = (flags & TCP_RST) != 0;
-
-            VTcpConn *c = FindVTcpConnByPeer(src_ip);
-
-            if (is_rst) {
-                if (c != nullptr) c->peer_closed = true;
-                return;
-            }
-
-            if (is_syn && !is_ack) {
-                // Incoming connection request (host role). Reply SYN-ACK
-                // immediately -- like a real kernel's TCP stack, not deferred
-                // to Accept(), which only ever dequeues an already-handshaked
-                // connection.
-                if (c != nullptr) return; // already connected to this peer -- stray/retransmitted SYN
-                for (auto &p : g_pending_accepts) {
-                    if (p.used && p.peer_ip == src_ip) return; // already pending
-                }
-                PendingAccept *slot = nullptr;
-                for (auto &p : g_pending_accepts) { if (!p.used) { slot = &p; break; } }
-                if (slot == nullptr) {
-                    LogFormat("BsdBridge: TCP SYN from 0x%08x:%u -- no free accept slot, dropped", src_ip, src_port);
-                    return;
-                }
-                u32 our_isn = 0;
-                ams::os::GenerateRandomBytes(std::addressof(our_isn), sizeof(our_isn));
-                slot->used = true;
-                slot->peer_ip = src_ip;
-                slot->peer_port = src_port;
-                slot->their_isn = seq;
-                slot->our_isn = our_isn;
-                slot->got_final_ack = false;
-                SendTcpSegment(local_ip, src_ip, LdnControlPort, src_port,
-                    our_isn, seq + 1, TCP_SYN | TCP_ACK, nullptr, 0);
-                LogFormat("BsdBridge: TCP SYN from 0x%08x:%u -- replied SYN-ACK", src_ip, src_port);
-                return;
-            }
-
-            if (is_syn && is_ack) {
-                // SYN-ACK reply to our own Connect() (client role): complete
-                // the handshake right here (send the final ACK ourselves --
-                // DrainRelay/this function has g_last_bridged_local_ip
-                // available even though it isn't a BsdBridgeService member).
-                if (c != nullptr && c->syn_sent_awaiting_synack && ack == c->our_isn + 1) {
-                    c->their_seq = seq + 1;
-                    c->our_seq = c->our_isn + 1;
-                    c->syn_sent_awaiting_synack = false;
-                    c->established = true;
-                    SendTcpSegment(local_ip, src_ip, LdnControlPort, src_port,
-                        c->our_seq, c->their_seq, TCP_ACK, nullptr, 0);
-                    LogFormat("BsdBridge: TCP SYN-ACK from 0x%08x:%u -- handshake complete", src_ip, src_port);
-                }
-                return;
-            }
-
-            if (is_fin) {
-                if (c != nullptr) {
-                    c->peer_closed = true;
-                    c->their_seq = seq + 1;
-                    SendTcpSegment(local_ip, src_ip, LdnControlPort, src_port,
-                        c->our_seq, c->their_seq, TCP_ACK, nullptr, 0);
-                }
-                return;
-            }
-
-            if (!is_ack) return; // nothing meaningful left to handle (a bare data-less, flagless segment)
-
-            // Final handshake ACK (host role)?
-            for (auto &p : g_pending_accepts) {
-                if (p.used && p.peer_ip == src_ip && !p.got_final_ack && ack == p.our_isn + 1) {
-                    p.got_final_ack = true;
-                    LogFormat("BsdBridge: TCP final ACK from 0x%08x:%u -- ready for Accept()", src_ip, src_port);
-                    return;
-                }
-            }
-
-            // Otherwise, a data (or pure-ack) segment on an established connection.
-            if (c == nullptr || !c->established || payload_len == 0) return;
-            if (seq != c->their_seq) {
-                // Out of order or a retransmit we've already applied -- drop.
-                // A real peer's own retransmit timer will resend if this was
-                // actually lost, no action needed on our side.
-                return;
-            }
-            if (c->inbox_ready) {
-                // Unconsumed data already queued -- do NOT ack, so the peer's
-                // real TCP stack retransmits once its timer fires (correct
-                // backpressure, not a bug).
-                return;
-            }
-            if (payload_len > VTcpInboxCap) {
-                LogFormat("BsdBridge: TCP data from 0x%08x:%u len=%zu too big, dropped", src_ip, src_port, payload_len);
-                return;
-            }
-            std::memcpy(c->inbox, payload, payload_len);
-            c->inbox_len = payload_len;
-            c->inbox_ready = true;
-            c->their_seq += static_cast<u32>(payload_len);
-            SendTcpSegment(local_ip, src_ip, LdnControlPort, src_port,
-                c->our_seq, c->their_seq, TCP_ACK, nullptr, 0);
-            LogFormat("BsdBridge: TCP data from 0x%08x:%u len=%zu -> filed for fd=%d, acked",
-                src_ip, src_port, payload_len, c->fd);
+        u64 NowMs() {
+            return ams::os::ConvertToTimeSpan(ams::os::GetSystemTick()).GetMilliSeconds();
         }
 
-        // Pops everything currently sitting in the relay's raw queue and files
-        // each packet by IP protocol: UDP (17) on LdnControlPort ->
-        // g_control_queue, TCP (6) on LdnControlPort -> HandleTcpSegment
-        // above. Called at the top of every bsd:u handler that touches the
-        // relay (RecvFrom, Poll, Select, Accept, Connect), so both channels
-        // stay fed regardless of which one ldn_mitm happens to be polling
-        // this tick.
-        void DrainRelay() {
-            u8 pkt[20 + 20 + slp::RELAY_MTU];
+        // ldn_mitm's own budget for this whole exchange is a flat,
+        // unconditional 1-second sleep (LANDiscovery::connect(),
+        // lan_discovery.cpp) -- not a generous multi-second timeout like
+        // originally assumed. 300ms/6 retries (up to 1.8s) was already
+        // longer than that. Tightened to fit multiple attempts inside the
+        // real budget instead of just one.
+        constexpr u64 DataRetransmitIntervalMs = 100;
+        constexpr int MaxDataRetransmits = 6; // up to 600ms of retrying
+
+        // Pops everything currently sitting in the relay's raw queue and
+        // files each UDP packet into g_control_queue (shared, port-tagged,
+        // claimed later by whichever bridged instance's own port matches --
+        // genuinely per-process now that a game's own gameplay socket can
+        // be bridged too). TCP segments are always ldn_mitm's own LDN
+        // station channel (LdnControlPort, checked below) and processed
+        // straight away against the single shared vtcp state, gated by
+        // ownership (g_active_ldn_instance) rather than claimed per-port --
+        // see this file's own comment on BsdBridgeService for why that
+        // state stays a single shared copy instead of being duplicated per
+        // process. Instance-agnostic on purpose: called continuously from
+        // the background drain thread, which has no specific
+        // process/instance context at all.
+        void DrainRawRelayQueue() {
+            {
+                BsdBridgeService *owner;
+                {
+                    std::scoped_lock lk(g_relay_mutex);
+                    owner = g_active_ldn_instance;
+                }
+                if (owner != nullptr) {
+                    std::scoped_lock lk(g_vtcp_mutex);
+                    owner->CheckDataRetransmits(g_last_bridged_local_ip);
+                }
+            }
+            u8 pkt[20 + 20 + MaxBridgedPayload];
             size_t pkt_len = 0;
             while (g_relay.PopIpv4(pkt, sizeof(pkt), &pkt_len) == 1) {
                 if (pkt_len < 20) continue;
                 u8 proto = pkt[9];
 
-                if (proto == 17) { // UDP -- unchanged control-channel path
+                if (proto == 17) { // UDP -- files into g_control_queue for
+                                    // WHICHEVER bridged process's RecvFrom is
+                                    // bound to this dst_port (ldn_mitm's own
+                                    // control channel, or any other process's
+                                    // gameplay socket -- no longer just
+                                    // LdnControlPort, see this file's own
+                                    // header comment).
                     u32 src_ip = 0; u16 dst_port = 0;
                     const u8 *payload = nullptr; size_t payload_len = 0;
                     if (!ParseIpv4Udp(pkt, pkt_len, src_ip, dst_port, payload, payload_len)) continue;
-                    if (dst_port != LdnControlPort) continue;
                     std::scoped_lock lk(g_control_queue_mutex);
                     if (g_control_count < ControlQueueSize) {
-                        const size_t tail = (g_control_head + g_control_count) % ControlQueueSize;
+                        ControlPacket &slot = g_control_queue[g_control_count];
                         // Re-store the FULL raw packet (not just the payload) so
                         // the control RecvFrom path below can reuse the exact
                         // same parsing it always has.
-                        size_t copy_len = pkt_len < sizeof(g_control_queue[tail].data) ? pkt_len : sizeof(g_control_queue[tail].data);
-                        std::memcpy(g_control_queue[tail].data, pkt, copy_len);
-                        g_control_queue[tail].len = copy_len;
+                        size_t copy_len = pkt_len < sizeof(slot.data) ? pkt_len : sizeof(slot.data);
+                        std::memcpy(slot.data, pkt, copy_len);
+                        slot.len = copy_len;
+                        slot.dst_port = dst_port;
                         g_control_count++;
                     }
                     continue;
@@ -590,17 +586,254 @@ namespace ams::mitm::bsd {
                 u32 seq = 0, ack = 0; u8 flags = 0;
                 const u8 *payload = nullptr; size_t payload_len = 0;
                 if (!ParseIpv4Tcp(pkt, pkt_len, src_ip, src_port, dst_port, seq, ack, flags, payload, payload_len)) continue;
-                if (dst_port != LdnControlPort) continue; // ldn_mitm's TCP station channel is always this port
+                if (dst_port != LdnControlPort) continue; // ldn_mitm's TCP station channel is always this port -- see this file's own comment on why the shared vtcp state doesn't need per-instance claiming
+
+                BsdBridgeService *owner;
+                {
+                    std::scoped_lock lk(g_relay_mutex);
+                    owner = g_active_ldn_instance;
+                }
+                if (owner == nullptr) continue; // no owning instance right now -- drop
 
                 std::scoped_lock lk(g_vtcp_mutex);
-                HandleTcpSegment(g_last_bridged_local_ip, src_ip, src_port, seq, ack, flags, payload, payload_len);
+                owner->HandleTcpSegment(g_last_bridged_local_ip, src_ip, src_port, seq, ack, flags, payload, payload_len);
             }
         }
     }
 
-    BsdBridgeService::~BsdBridgeService() {}
+    BsdBridgeService::~BsdBridgeService() {
+        // Safety net alongside Close()'s own clearing below: whatever the
+        // teardown path was, this instance must never be left as the
+        // background drain thread's target once it's gone.
+        std::scoped_lock lk(g_relay_mutex);
+        if (g_active_ldn_instance == this) g_active_ldn_instance = nullptr;
+    }
 
     slp::RelayBridge &BsdBridgeService::GetRelay() { return g_relay; }
+
+    void BsdBridgeService::TrackFd(s32 fd, s32 type) {
+        if (fd < 0) return;
+        for (size_t i = 0; i < MaxTrackedFds; i++) {
+            if (m_tracked_fd[i] == -1 || m_tracked_fd[i] == fd) {
+                m_tracked_fd[i] = fd;
+                m_tracked_type[i] = type;
+                return;
+            }
+        }
+    }
+
+    void BsdBridgeService::UntrackFd(s32 fd) {
+        for (size_t i = 0; i < MaxTrackedFds; i++) {
+            if (m_tracked_fd[i] == fd) m_tracked_fd[i] = -1;
+        }
+    }
+
+    s32 BsdBridgeService::GetTrackedType(s32 fd) const {
+        for (size_t i = 0; i < MaxTrackedFds; i++) {
+            if (m_tracked_fd[i] == fd) return m_tracked_type[i];
+        }
+        return -1;
+    }
+
+    VTcpConn *BsdBridgeService::FindVTcpConnByFd(s32 fd) {
+        if (this != g_active_ldn_instance) return nullptr; // not the verified owner of the shared vtcp state -- never match a coincidentally-equal fd from a different process
+        for (auto &c : g_vtcp_conns) { if (c.used && c.fd == fd) return &c; }
+        return nullptr;
+    }
+    // Matches by peer IP alone: ldn_mitm always uses port 11452 for both
+    // sides of this channel, so a peer's IP alone is enough to tell its one
+    // connection apart from every other peer's (host role can have several
+    // stations, one per distinct console/peer IP).
+    VTcpConn *BsdBridgeService::FindVTcpConnByPeer(u32 peer_ip) {
+        if (this != g_active_ldn_instance) return nullptr;
+        for (auto &c : g_vtcp_conns) { if (c.used && c.peer_ip == peer_ip) return &c; }
+        return nullptr;
+    }
+    VTcpConn *BsdBridgeService::AllocVTcpConn() {
+        if (this != g_active_ldn_instance) return nullptr;
+        for (auto &c : g_vtcp_conns) {
+            if (!c.used) {
+                c = VTcpConn{};
+                c.used = true;
+                return &c;
+            }
+        }
+        return nullptr;
+    }
+
+    bool BsdBridgeService::IsOwnTcpListenFd(s32 fd) const {
+        return this == g_active_ldn_instance && fd == g_tcp_listen_fd;
+    }
+
+    namespace {
+        // Defined earlier in this file (free functions): SendTcpSegment,
+        // TCP_FIN/SYN/RST/PSH/ACK, LdnControlPort, VTcpInboxCap.
+    }
+
+    // Processes one already-parsed incoming TCP segment against THIS
+    // instance's own vtcp state. Caller must hold g_vtcp_mutex. Factored
+    // out of DrainRelay originally so the segment-classification switch
+    // could just `return` instead of juggling `continue`/`goto` inside the
+    // popping loop -- kept as its own method now that DrainRelay claims
+    // segments from the shared queue instead of parsing them inline.
+    void BsdBridgeService::HandleTcpSegment(u32 local_ip, u32 src_ip, u16 src_port,
+            u32 seq, u32 ack, u8 flags, const u8 *payload, size_t payload_len) {
+        const bool is_syn = (flags & TCP_SYN) != 0;
+        const bool is_ack = (flags & TCP_ACK) != 0;
+        const bool is_fin = (flags & TCP_FIN) != 0;
+        const bool is_rst = (flags & TCP_RST) != 0;
+
+        VTcpConn *c = FindVTcpConnByPeer(src_ip);
+
+        if (is_rst) {
+            if (c != nullptr) c->peer_closed = true;
+            LogFormat("BsdBridge: TCP RST from 0x%08x:%u -- peer aborted the connection", src_ip, src_port);
+            return;
+        }
+
+        if (is_syn && !is_ack) {
+            // Incoming connection request (host role). Reply SYN-ACK
+            // immediately -- like a real kernel's TCP stack, not deferred
+            // to Accept(), which only ever dequeues an already-handshaked
+            // connection.
+            if (c != nullptr) return; // already connected to this peer -- stray/retransmitted SYN
+            for (auto &p : g_pending_accepts) {
+                if (p.used && p.peer_ip == src_ip) return; // already pending
+            }
+            PendingAccept *slot = nullptr;
+            for (auto &p : g_pending_accepts) { if (!p.used) { slot = &p; break; } }
+            if (slot == nullptr) {
+                LogFormat("BsdBridge: TCP SYN from 0x%08x:%u -- no free accept slot, dropped", src_ip, src_port);
+                return;
+            }
+            u32 our_isn = 0;
+            ams::os::GenerateRandomBytes(std::addressof(our_isn), sizeof(our_isn));
+            slot->used = true;
+            slot->peer_ip = src_ip;
+            slot->peer_port = src_port;
+            slot->their_isn = seq;
+            slot->our_isn = our_isn;
+            slot->got_final_ack = false;
+            SendTcpSegment(local_ip, src_ip, LdnControlPort, src_port,
+                our_isn, seq + 1, TCP_SYN | TCP_ACK, nullptr, 0);
+            LogFormat("BsdBridge: TCP SYN from 0x%08x:%u -- replied SYN-ACK", src_ip, src_port);
+            return;
+        }
+
+        if (is_syn && is_ack) {
+            // SYN-ACK reply to our own Connect() (client role): complete
+            // the handshake right here (send the final ACK ourselves).
+            if (c != nullptr && c->syn_sent_awaiting_synack && ack == c->our_isn + 1) {
+                c->their_seq = seq + 1;
+                c->our_seq = c->our_isn + 1;
+                c->syn_sent_awaiting_synack = false;
+                c->established = true;
+                SendTcpSegment(local_ip, src_ip, LdnControlPort, src_port,
+                    c->our_seq, c->their_seq, TCP_ACK, nullptr, 0);
+                LogFormat("BsdBridge: TCP SYN-ACK from 0x%08x:%u -- handshake complete", src_ip, src_port);
+            }
+            return;
+        }
+
+        if (is_fin) {
+            if (c != nullptr) {
+                c->peer_closed = true;
+                c->their_seq = seq + 1;
+                SendTcpSegment(local_ip, src_ip, LdnControlPort, src_port,
+                    c->our_seq, c->their_seq, TCP_ACK, nullptr, 0);
+                LogFormat("BsdBridge: TCP FIN from 0x%08x:%u -- peer closed the connection", src_ip, src_port);
+            }
+            return;
+        }
+
+        if (!is_ack) return; // nothing meaningful left to handle (a bare data-less, flagless segment)
+
+        // Final handshake ACK (host role)?
+        for (auto &p : g_pending_accepts) {
+            if (p.used && p.peer_ip == src_ip && !p.got_final_ack && ack == p.our_isn + 1) {
+                p.got_final_ack = true;
+                LogFormat("BsdBridge: TCP final ACK from 0x%08x:%u -- ready for Accept()", src_ip, src_port);
+                return;
+            }
+        }
+
+        // Our pending outbound data segment (if any) just got acked --
+        // whether this is a bare ACK or one piggybacked on the peer's own
+        // data. Stop retransmitting it. Must run before the
+        // payload_len==0 early-return just below, since a bare ACK (no
+        // data) is exactly the normal way a peer acks our send.
+        if (c != nullptr && c->has_unacked_data &&
+                ack == c->unacked_seq + static_cast<u32>(c->unacked_data_len)) {
+            c->has_unacked_data = false;
+        }
+
+        // Otherwise, a data (or pure-ack) segment on an established connection.
+        if (c == nullptr || !c->established || payload_len == 0) return;
+        if (seq != c->their_seq) {
+            // Out of order or a retransmit we've already applied -- drop.
+            // A real peer's own retransmit timer will resend if this was
+            // actually lost, no action needed on our side.
+            return;
+        }
+        if (c->inbox_ready) {
+            // Unconsumed data already queued -- do NOT ack, so the peer's
+            // real TCP stack retransmits once its timer fires (correct
+            // backpressure, not a bug).
+            return;
+        }
+        if (payload_len > VTcpInboxCap) {
+            LogFormat("BsdBridge: TCP data from 0x%08x:%u len=%zu too big, dropped", src_ip, src_port, payload_len);
+            return;
+        }
+        std::memcpy(c->inbox, payload, payload_len);
+        c->inbox_len = payload_len;
+        c->inbox_ready = true;
+        c->their_seq += static_cast<u32>(payload_len);
+        SendTcpSegment(local_ip, src_ip, LdnControlPort, src_port,
+            c->our_seq, c->their_seq, TCP_ACK, nullptr, 0);
+        LogFormat("BsdBridge: TCP data from 0x%08x:%u len=%zu -> filed for fd=%d, acked",
+            src_ip, src_port, payload_len, c->fd);
+        LogLdnPacketIfRecognized("recv", payload, payload_len);
+    }
+
+    // Resends the shared vtcp state's established connections' unacked
+    // outbound data segments past their retransmit interval. Caller must
+    // hold g_vtcp_mutex. Only ever called on g_active_ldn_instance (see
+    // DrainRawRelayQueue), so no separate ownership check needed here.
+    void BsdBridgeService::CheckDataRetransmits(u32 local_ip) {
+        u64 now = NowMs();
+        for (auto &c : g_vtcp_conns) {
+            if (!c.used || !c.established || !c.has_unacked_data) continue;
+            if (now - c.last_send_tick_ms < DataRetransmitIntervalMs) continue;
+            if (c.retransmit_count >= MaxDataRetransmits) {
+                // Give up resending -- ldn_mitm's own higher-level timeout
+                // will notice and tear the session down on its own; no
+                // point flooding the relay forever.
+                c.has_unacked_data = false;
+                LogFormat("BsdBridge: TCP data to 0x%08x:%u -- gave up retransmitting after %d attempts",
+                    c.peer_ip, c.peer_port, c.retransmit_count);
+                continue;
+            }
+            c.retransmit_count++;
+            c.last_send_tick_ms = now;
+            SendTcpSegment(local_ip, c.peer_ip, LdnControlPort, c.peer_port,
+                c.unacked_seq, c.their_seq, TCP_PSH | TCP_ACK, c.unacked_data, c.unacked_data_len);
+            LogFormat("BsdBridge: TCP data to 0x%08x:%u len=%zu -- retransmit #%d (no ack yet)",
+                c.peer_ip, c.peer_port, c.unacked_data_len, c.retransmit_count);
+        }
+    }
+
+    // Drains the shared raw relay queue (instance-agnostic) and then claims
+    // + processes any TCP segments and retransmit checks belonging to THIS
+    // instance's own bridged port.
+    void BsdBridgeService::DrainRelay() {
+        // TCP-segment handling and retransmit-checking now happen directly
+        // inside DrainRawRelayQueue itself (gated by ownership, not by
+        // per-instance port-claiming -- see its own comment), so this just
+        // needs to make sure the shared queues are freshly drained before
+        // the caller checks its own readability.
+        DrainRawRelayQueue();
+    }
 
     bool BsdBridgeService::IsRelayConnected() {
         std::scoped_lock lk(g_relay_mutex);
@@ -612,6 +845,7 @@ namespace ams::mitm::bsd {
         bool ConnectRelayLocked() {
             EnsureSocketStack(); // lazy: must precede the relay socket's ::socket()
             EnsureWatchdogStarted();
+            EnsureDrainThreadStarted();
             g_relay_connect_attempted = true;
 
             char host[128];
@@ -693,10 +927,45 @@ namespace ams::mitm::bsd {
     }
 
     bool BsdBridgeService::ShouldMitm(const sm::MitmProcessInfo &client_info) {
-        // ldn_mitm's own program_id -- see notes/, confirmed from its
-        // res/app.json this session (0x4200000000000010, the real
-        // upstream ldn_mitm's own reserved id, distinct from every other
-        // project's homebrew id on this SD card).
+        // REVERTED to ldn_mitm-only. Widening this to (almost) everyone --
+        // see this file's header comment for the reasoning (a game's own
+        // gameplay socket is a separate process from ldn_mitm and normally
+        // invisible here) -- was tried twice and caused two separate live
+        // incidents even after fixing the bug each one exposed:
+        //
+        // Attempt 1 broke the FTP server: the vtcp connection-tracking
+        // state (g_vtcp_conns, g_tcp_listen_fd, g_pending_accepts, the
+        // fd-type-tracking tables) were file globals shared across every
+        // mitm'd process, safe only when ldn_mitm was the sole one ever
+        // bridged -- fds are a PER-PROCESS numbering space, so sys-ftpd's
+        // own fd numbers could collide with ldn_mitm's tracked ones. Worse,
+        // Listen()/Connect() triggered their virtual-TCP paths off "is this
+        // fd a SOCK_STREAM socket" alone, with no port check at all -- ANY
+        // mitm'd process's own real TCP listen/connect got permanently
+        // hijacked, whether or not any fd number ever collided. Fixed by
+        // moving the vtcp state onto the instance itself.
+        //
+        // Attempt 2 (the per-instance fix above) exhausted this
+        // sysmodule's heap instead: that state carries two 2KB buffers per
+        // slot (~37KB total), and duplicating it onto EVERY mitm'd process
+        // (qlaunch, background sysmodules, the game itself) crashed the
+        // console the moment the game's own process tried to connect.
+        // Fixed by moving the vtcp state back to a single shared copy,
+        // gated by ownership (g_active_ldn_instance) instead of duplicated.
+        //
+        // With BOTH of those fixed, real gameplay data did bridge
+        // successfully for extended stretches (minutes at a time,
+        // confirmed live) -- but a live console session that night still
+        // hit further instability (a crash following a Stop() call from
+        // the overlay, plus inconsistent join behavior) that wasn't
+        // isolated before deciding to stop testing on a daily-driver
+        // console for the night. The FindVTcpConnByFd/ByPeer/
+        // AllocVTcpConn/IsOwnTcpListenFd ownership-gating and the
+        // Bind()/Listen()/Connect() port-scoping all stay in place --
+        // reverting ONLY which processes ShouldMitm accepts, so this is a
+        // one-line, low-risk way back to the version that ran the whole
+        // night with zero crashes. Widening it again needs to happen with
+        // more controlled testing, not live on someone's daily driver.
         constexpr u64 LdnMitmProgramId = 0x4200000000000010ULL;
         bool target = client_info.program_id.value == LdnMitmProgramId;
         LogFormat("BsdBridge ShouldMitm: pid=%lu program_id=0x%016lx -> %s",
@@ -803,29 +1072,30 @@ namespace ams::mitm::bsd {
         return rc;
     }
 
-    namespace {
-        // Shared by Poll/Select: is THIS specific fd (the UDP control fd, the
-        // virtual TCP listener, or an established virtual TCP connection)
-        // sitting on data ldn_mitm hasn't read yet? Callers must call
-        // DrainRelay() first so these flags are current.
-        bool VFdHasPendingRead(s32 poll_fd, s32 bridged_udp_fd) {
-            if (poll_fd < 0) return false; // -1 = "ignored" poll slot; must never match an also-unset -1 tracked fd
-            if (poll_fd == bridged_udp_fd) {
-                std::scoped_lock lk(g_control_queue_mutex);
-                return g_control_count > 0;
+    bool BsdBridgeService::VFdHasPendingRead(s32 poll_fd) {
+        if (poll_fd < 0) return false; // -1 = "ignored" poll slot; must never match an also-unset -1 tracked fd
+        if (poll_fd == m_bridged_fd) {
+            std::scoped_lock lk(g_control_queue_mutex);
+            // g_control_queue is shared across every bridged process's UDP
+            // socket now -- only report readable if something in there is
+            // actually addressed to THIS instance's own port, not just "the
+            // queue has something in it for someone".
+            for (size_t i = 0; i < g_control_count; i++) {
+                if (g_control_queue[i].dst_port == m_bridged_local_port) return true;
             }
-            std::scoped_lock lk(g_vtcp_mutex);
-            if (poll_fd == g_tcp_listen_fd) {
-                // Only report readable once a connection is FULLY handshaked
-                // (got_final_ack) -- accept() should never return before
-                // that, matching real TCP semantics; a raw not-yet-ACKed SYN
-                // isn't something Accept() can do anything with yet.
-                for (auto &p : g_pending_accepts) if (p.used && p.got_final_ack) return true;
-                return false;
-            }
-            VTcpConn *c = FindVTcpConnByFd(poll_fd);
-            return c != nullptr && (c->inbox_ready || c->peer_closed);
+            return false;
         }
+        std::scoped_lock lk(g_vtcp_mutex);
+        if (IsOwnTcpListenFd(poll_fd)) {
+            // Only report readable once a connection is FULLY handshaked
+            // (got_final_ack) -- accept() should never return before that,
+            // matching real TCP semantics; a raw not-yet-ACKed SYN isn't
+            // something Accept() can do anything with yet.
+            for (auto &p : g_pending_accepts) if (p.used && p.got_final_ack) return true;
+            return false;
+        }
+        VTcpConn *c = FindVTcpConnByFd(poll_fd); // nullptr if this instance doesn't own the shared vtcp state
+        return c != nullptr && (c->inbox_ready || c->peer_closed);
     }
 
     Result BsdBridgeService::Select(sf::Out<s32> out_count, sf::Out<s32> out_errno, const SelectInData &in_data,
@@ -906,7 +1176,7 @@ namespace ams::mitm::bsd {
         // control fd, the virtual TCP listener, and every established
         // virtual TCP connection, not just the one control fd.
         auto inject = [&](s32 fd) {
-            if (fd < 0 || !VFdHasPendingRead(fd, m_bridged_fd)) return;
+            if (fd < 0 || !VFdHasPendingRead(fd)) return;
             if (readfds_out.GetSize() < (static_cast<size_t>(fd) / 32 + 1) * sizeof(u32)) return;
             u32 *words = reinterpret_cast<u32 *>(readfds_out.GetPointer());
             u32 &word = words[fd / 32];
@@ -917,8 +1187,14 @@ namespace ams::mitm::bsd {
             }
         };
         inject(m_bridged_fd);
-        inject(g_tcp_listen_fd);
-        for (auto &c : g_vtcp_conns) if (c.used) inject(c.fd);
+        // The shared vtcp state (TCP listener + connections) only applies
+        // to whichever instance actually owns it -- see this file's own
+        // comment on BsdBridgeService for why that's a single shared copy
+        // gated by ownership rather than a per-instance one.
+        if (this == g_active_ldn_instance) {
+            inject(g_tcp_listen_fd);
+            for (auto &c : g_vtcp_conns) if (c.used) inject(c.fd);
+        }
 
         out_count.SetValue(count);
         return rc;
@@ -990,8 +1266,24 @@ namespace ams::mitm::bsd {
             out_errno.SetValue(out.err);
             if (out.ret > 0) {
                 for (s32 j = 0; j < forward_nfds; j++) {
-                    pfds_out[forward_index[j]].revents = forward_out[j].revents;
-                    if (forward_out[j].revents != 0) count++;
+                    u32 revents = forward_out[j].revents;
+                    // ldn_mitm's own LDUdpSocket::onClose() has no retry/recovery --
+                    // a transient local-interface hiccup (sleep, airplane mode, a
+                    // brief WiFi drop) makes it latch a permanent SignalLost/Error
+                    // state and spin on the dead fd forever, even though the
+                    // interface (and our own relay connection underneath it) may
+                    // recover seconds later. We never route this fd's actual data
+                    // through the real socket anyway (SendTo/RecvFrom for it go
+                    // through g_relay), so its real POLLERR/POLLHUP is not
+                    // information ldn_mitm needs -- swallow it here instead of
+                    // letting it trigger ldn_mitm's own unrecoverable error path.
+                    // Scoped to only the bridged UDP control fd, not TCP virtual
+                    // connections, where a real peer disconnect is genuine signal.
+                    if (pfds_in[forward_index[j]].fd == m_bridged_fd && m_bridged_local_port == LdnControlPort) {
+                        revents &= ~(POLLERR | POLLHUP | POLLNVAL);
+                    }
+                    pfds_out[forward_index[j]].revents = revents;
+                    if (revents != 0) count++;
                 }
             }
         } else {
@@ -1007,7 +1299,7 @@ namespace ams::mitm::bsd {
         // something pending, OR in POLLIN and fix up the returned count.
         for (s32 i = 0; i < nfds; i++) {
             if (pfds_out[i].revents & (POLLIN | POLLPRI | POLLERR | POLLHUP | POLLNVAL)) continue;
-            if (!VFdHasPendingRead(pfds_out[i].fd, m_bridged_fd)) continue;
+            if (!VFdHasPendingRead(pfds_out[i].fd)) continue;
             pfds_out[i].revents |= POLLIN;
             count++;
             LogFormat("BsdBridge: Poll injected POLLIN for fd=%d", pfds_out[i].fd);
@@ -1064,19 +1356,26 @@ namespace ams::mitm::bsd {
             u16 port = ntohs(sin.sin_port);
             bool is_udp = GetTrackedType(fd) == SOCK_DGRAM;
             if (port == LdnControlPort && !is_udp) {
+                // ldn_mitm's OWN TCP station listener socket (separate fd
+                // from its UDP control socket, same port number). Remember
+                // this exact fd so Listen() can gate g_tcp_listen_fd on it
+                // specifically -- see Listen()'s own comment for why that
+                // gating matters (it's what keeps an unrelated process's
+                // own real TCP listener from being hijacked).
+                m_ldn_tcp_bind_fd = fd;
                 LogFormat("BsdBridge: Bind fd=%d -> port %u but NOT UDP (tcp listener); forwarding only",
                     fd, port);
             }
-            if (port == LdnControlPort && is_udp) {
-                m_bridged_fd = fd;
-                LogFormat("BsdBridge: Bind fd=%d -> port %u matched (UDP), bridging this socket to the relay",
-                    fd, port);
-
+            if (is_udp) {
                 // Learn our own local IP the same way ldn_mitm itself would
                 // see it (nifmGetCurrentIpAddress internally resolves the
                 // same interface state GetSockName reads here) -- see the
                 // header's own comment on why this must stay consistent
-                // rather than inventing a separate address.
+                // rather than inventing a separate address. Done for EVERY
+                // UDP bind now (not just LdnControlPort) so a DIFFERENT
+                // process's own gameplay socket can be recognized as
+                // LDN-relevant by sharing this same address, below.
+                u32 learned_ip = 0;
                 u8 sockname_buf[sizeof(struct sockaddr_in)];
                 RetErrno gsn_out{};
                 Result gsn_rc = serviceMitmDispatchInOut(m_forward_service.get(), 16, in, gsn_out,
@@ -1085,29 +1384,66 @@ namespace ams::mitm::bsd {
                 if (R_SUCCEEDED(gsn_rc) && gsn_out.err == 0) {
                     struct sockaddr_in local_sin;
                     std::memcpy(&local_sin, sockname_buf, sizeof(local_sin));
-                    m_bridged_local_ip = ntohl(local_sin.sin_addr.s_addr);
+                    learned_ip = ntohl(local_sin.sin_addr.s_addr);
                 }
 
                 // Fallback: with no associated WiFi interface GetSockName can
                 // legitimately report 0.0.0.0; the relay routes replies by
                 // the source IP we embed in each packet, so a zero source
                 // would make every response unroutable. nifm knows our real
-                // address even when the raw socket view doesn't.
-                if (m_bridged_local_ip == 0) {
+                // address even when the raw socket view doesn't -- and since
+                // every bridged process shares the SAME nifm interface, this
+                // fallback is also what makes a game's own socket resolve to
+                // the identical address ldn_mitm's own control channel used,
+                // even if ITS GetSockName also comes back zero.
+                if (learned_ip == 0) {
                     u32 nifm_ip = 0;
                     EnsureSocketStack(); // nifmGetCurrentIpAddress needs nifm initialized
                     if (R_SUCCEEDED(nifmGetCurrentIpAddress(&nifm_ip)) && nifm_ip != 0) {
-                        m_bridged_local_ip = ntohl(nifm_ip);
+                        learned_ip = ntohl(nifm_ip);
                         LogFormat("BsdBridge: GetSockName gave 0.0.0.0, using nifm ip instead");
                     }
                 }
-                LogFormat("BsdBridge: bridged socket local ip = 0x%08x", m_bridged_local_ip);
+
+                // Bridge-worthy if this is ldn_mitm's own known control
+                // port (the original, still-needed case -- this is also
+                // what FIRST establishes g_last_bridged_local_ip each
+                // session, before any other process could possibly match
+                // it), OR this socket's own address matches the LDN virtual
+                // subnet another process already established -- i.e. a
+                // game's own gameplay socket, bound to the SAME
+                // nifm-assigned address LDN is using. Everything else
+                // (unrelated real internet traffic from any process) falls
+                // through untouched.
+                u32 established_ip;
                 {
                     std::scoped_lock lk(g_relay_mutex);
-                    g_last_bridged_local_ip = m_bridged_local_ip;
+                    established_ip = g_last_bridged_local_ip;
                 }
+                bool is_ldn_control_port = (port == LdnControlPort);
+                bool is_ldn_subnet_match = (established_ip != 0 && learned_ip == established_ip);
 
-                EnsureRelayConnected();
+                if (is_ldn_control_port || is_ldn_subnet_match) {
+                    m_bridged_fd = fd;
+                    m_bridged_local_ip = learned_ip;
+                    m_bridged_local_port = port;
+                    LogFormat("BsdBridge: Bind fd=%d -> port %u (%s), bridging this socket to the relay, local ip = 0x%08x",
+                        fd, port, is_ldn_control_port ? "ldn_mitm control port" : "matches LDN subnet",
+                        m_bridged_local_ip);
+
+                    {
+                        std::scoped_lock lk(g_relay_mutex);
+                        g_last_bridged_local_ip = m_bridged_local_ip;
+                        g_bridged_socket_count++;
+                        // See g_active_ldn_instance's own comment -- only
+                        // ever set for a socket verified to actually be
+                        // ldn_mitm's own control channel, never for a
+                        // subnet-matched OTHER process's own socket.
+                        if (is_ldn_control_port) g_active_ldn_instance = this;
+                    }
+
+                    EnsureRelayConnected();
+                }
             }
         }
         return rc;
@@ -1135,16 +1471,27 @@ namespace ams::mitm::bsd {
                     out_size.SetValue(-1);
                     return ResultSuccess();
                 }
-                // Real TCP data segment: PSH|ACK, our current seq/ack. No
-                // retransmission on our side if this is lost -- ldn_mitm's
-                // own higher-level protocol (waiting for a SyncNetwork reply
-                // to a Connect, etc.) is what notices and retries, same as it
-                // would over a real flaky network.
+                // Real TCP data segment: PSH|ACK, our current seq/ack.
+                // Recorded into unacked_data so CheckDataRetransmits (called
+                // from DrainRelay) resends it if no ack shows up in time --
+                // the relay's own transport is unreliable UDP, and this used
+                // to be genuinely fire-and-forget, which is what let a
+                // single dropped join/SyncNetwork packet turn into a
+                // "communication error" with no recovery.
                 ssize_t sent = SendTcpSegment(m_bridged_local_ip, c->peer_ip, LdnControlPort, c->peer_port,
                     c->our_seq, c->their_seq, TCP_PSH | TCP_ACK, buffer.GetPointer(), payload_len);
                 LogFormat("BsdBridge: SendTo(tcp fd=%d, %zu bytes -> peer 0x%08x:%u seq=%u) relay_sent=%zd",
                     fd, payload_len, c->peer_ip, c->peer_port, c->our_seq, sent);
-                if (sent >= 0) c->our_seq += static_cast<u32>(payload_len);
+                LogLdnPacketIfRecognized("send", static_cast<const u8 *>(buffer.GetPointer()), payload_len);
+                if (sent >= 0) {
+                    c->has_unacked_data = true;
+                    std::memcpy(c->unacked_data, buffer.GetPointer(), payload_len);
+                    c->unacked_data_len = payload_len;
+                    c->unacked_seq = c->our_seq;
+                    c->last_send_tick_ms = NowMs();
+                    c->retransmit_count = 0;
+                    c->our_seq += static_cast<u32>(payload_len);
+                }
                 TouchBridgeActivity();
                 out_errno.SetValue(sent >= 0 ? 0 : EIO);
                 out_size.SetValue(sent >= 0 ? static_cast<s32>(payload_len) : -1);
@@ -1181,7 +1528,7 @@ namespace ams::mitm::bsd {
         u16 dst_port = ntohs(dst_sin.sin_port);
 
         const size_t payload_len = buffer.GetSize();
-        u8 packet[20 + 8 + slp::RELAY_MTU];
+        u8 packet[20 + 8 + MaxBridgedPayload];
         size_t total = 20 + 8 + payload_len;
         if (total > sizeof(packet)) {
             out_errno.SetValue(EMSGSIZE);
@@ -1201,7 +1548,12 @@ namespace ams::mitm::bsd {
 
         u8 *udp = packet + 20;
         u16 udp_len = static_cast<u16>(8 + payload_len);
-        udp[0] = static_cast<u8>(LdnControlPort >> 8); udp[1] = static_cast<u8>(LdnControlPort);
+        // Source port must be THIS instance's own bound port, not always
+        // LdnControlPort -- true for ldn_mitm's own control channel, but a
+        // game's own gameplay socket is bound to some other port, and
+        // stamping the wrong source port here would make the peer's own
+        // reply come back addressed to a port nobody's listening on.
+        udp[0] = static_cast<u8>(m_bridged_local_port >> 8); udp[1] = static_cast<u8>(m_bridged_local_port);
         udp[2] = static_cast<u8>(dst_port >> 8); udp[3] = static_cast<u8>(dst_port);
         udp[4] = static_cast<u8>(udp_len >> 8); udp[5] = static_cast<u8>(udp_len);
         udp[6] = 0; udp[7] = 0;
@@ -1227,6 +1579,9 @@ namespace ams::mitm::bsd {
             VTcpConn *c = FindVTcpConnByFd(fd);
             if (c != nullptr) {
                 if (!c->inbox_ready) {
+                    if (c->peer_closed) {
+                        LogFormat("BsdBridge: RecvFrom(tcp fd=%d) -- delivering EOF (peer_closed) to ldn_mitm", fd);
+                    }
                     out_ret.SetValue(c->peer_closed ? 0 : -1);
                     out_errno.SetValue(c->peer_closed ? 0 : EWOULDBLOCK);
                     out_addrlen.SetValue(0);
@@ -1272,22 +1627,22 @@ namespace ams::mitm::bsd {
         // Deliver one packet from g_control_queue (filed by DrainRelay above,
         // which is now the only caller of GetRelay().PopIpv4() -- see its own
         // comment for why RecvFrom no longer pops the shared relay queue
-        // directly).
-        u8 ip_packet[20 + 8 + slp::RELAY_MTU];
+        // directly). Shared across every bridged process's UDP socket now,
+        // so pull specifically the first entry addressed to THIS instance's
+        // own bound port -- see PopControlPacketForPort's own comment.
+        u8 ip_packet[20 + 8 + MaxBridgedPayload];
         size_t ip_len = 0;
         {
             std::scoped_lock lk(g_control_queue_mutex);
-            if (g_control_count == 0) {
+            ControlPacket pkt;
+            if (!PopControlPacketForPort(m_bridged_local_port, pkt)) {
                 out_ret.SetValue(-1);
                 out_errno.SetValue(EWOULDBLOCK);
                 out_addrlen.SetValue(0);
                 return ResultSuccess();
             }
-            ControlPacket &pkt = g_control_queue[g_control_head];
             ip_len = pkt.len < sizeof(ip_packet) ? pkt.len : sizeof(ip_packet);
             std::memcpy(ip_packet, pkt.data, ip_len);
-            g_control_head = (g_control_head + 1) % ControlQueueSize;
-            g_control_count--;
         }
 
         u32 src_ip = 0; u16 dst_port_unused = 0;
@@ -1344,7 +1699,7 @@ namespace ams::mitm::bsd {
                     fd, c->peer_ip, c->peer_port);
                 *c = VTcpConn{};
             }
-            if (fd == g_tcp_listen_fd) {
+            if (IsOwnTcpListenFd(fd)) {
                 g_tcp_listen_fd = -1;
                 LogFormat("BsdBridge: Close(fd=%d) -- was the virtual TCP listener", fd);
             }
@@ -1365,25 +1720,36 @@ namespace ams::mitm::bsd {
         UntrackFd(fd);
         if (IsBridged(fd)) {
             LogFormat("BsdBridge: Close(fd=%d) -- unbridging (was the relay-bridged socket)", fd);
+            bool was_ldn_control_port = (m_bridged_local_port == LdnControlPort);
             m_bridged_fd = -1;
             m_bridged_local_ip = 0;
+            m_bridged_local_port = 0;
 
-            // Tear down the relay connection too, not just the local bridged
-            // fd. g_relay is a process-wide singleton, only ever opened
-            // lazily -- without this it outlives the LDN session entirely,
-            // so a stale/dead connection (relay restarted, PC slept and its
-            // NAT mapping expired, etc.) gets silently REUSED by the next
-            // game's session instead of reconnecting fresh, leaving
-            // "connected" stuck in the overlay and every subsequent join
-            // failing with a communication error until a full reboot.
-            // Closing here means the next EnsureRelayConnected() (from
+            // Tear down the relay connection too, but only once the LAST
+            // bridged socket across every process closes -- g_relay is a
+            // single global singleton now shared by ldn_mitm's own control
+            // channel AND any other process's own gameplay socket (see
+            // this file's own header comment), so closing it on the FIRST
+            // one to go away would yank the tunnel out from under whichever
+            // one is still active. Without eventually closing it at all,
+            // it would outlive the LDN session entirely, so a stale/dead
+            // connection (relay restarted, PC slept and its NAT mapping
+            // expired, etc.) gets silently REUSED by the next game's
+            // session instead of reconnecting fresh, leaving "connected"
+            // stuck in the overlay and every subsequent join failing with
+            // a communication error until a full reboot. Closing once
+            // count hits zero means the next EnsureRelayConnected() (from
             // whatever LDN session comes next) always dials a brand new
             // connection.
             std::scoped_lock relay_lk(g_relay_mutex);
-            g_relay.Close();
-            g_relay_connect_attempted = false;
-            g_last_bridged_local_ip = 0;
-            g_last_bridge_activity_ms.store(0, std::memory_order_relaxed);
+            if (was_ldn_control_port && g_active_ldn_instance == this) g_active_ldn_instance = nullptr;
+            if (g_bridged_socket_count > 0) g_bridged_socket_count--;
+            if (g_bridged_socket_count == 0) {
+                g_relay.Close();
+                g_relay_connect_attempted = false;
+                g_last_bridged_local_ip = 0;
+                g_last_bridge_activity_ms.store(0, std::memory_order_relaxed);
+            }
         }
         return rc;
     }
@@ -1411,7 +1777,7 @@ namespace ams::mitm::bsd {
         // TCP stack: accept() only ever DEQUEUES an already-handshaked
         // connection, it doesn't drive the handshake), so this just needs to
         // find a got_final_ack pending accept and turn it into a real fd.
-        if (fd == g_tcp_listen_fd) {
+        if (IsOwnTcpListenFd(fd)) {
             DrainRelay();
             std::scoped_lock lk(g_vtcp_mutex);
             for (auto &p : g_pending_accepts) {
@@ -1465,7 +1831,25 @@ namespace ams::mitm::bsd {
     }
 
     Result BsdBridgeService::Connect(sf::Out<s32> out_ret, sf::Out<s32> out_errno, s32 fd, const sf::InAutoSelectBuffer &addr) {
-        if (GetTrackedType(fd) == SOCK_STREAM) {
+        // Parsed up front now, regardless of type, so the branch below can
+        // gate on the ACTUAL destination, not just "is this a TCP socket".
+        struct sockaddr_in dst_sin{};
+        if (addr.GetSize() >= sizeof(dst_sin)) {
+            std::memcpy(&dst_sin, addr.GetPointer(), sizeof(dst_sin));
+        }
+        u32 dst_ip = ntohl(dst_sin.sin_addr.s_addr);
+        u16 dst_port = ntohs(dst_sin.sin_port);
+
+        // Only ldn_mitm's own LDN station channel ever needs the virtual
+        // connect below -- gated on BOTH being a TCP socket AND actually
+        // targeting LdnControlPort, not just "any SOCK_STREAM socket's
+        // connect() call" (that used to hijack ANY outbound TCP connect
+        // from ANY mitm'd process once ShouldMitm covered more than
+        // ldn_mitm -- a real connect() to a real destination would have
+        // been silently rerouted through the relay instead of actually
+        // reaching it). Everything else falls through to the real forward
+        // below, same as always.
+        if (GetTrackedType(fd) == SOCK_STREAM && dst_port == LdnControlPort) {
             // Client role: ldn_mitm's own LANDiscovery::connect()
             // (lan_discovery.cpp) does a single synchronous ::connect() on
             // this fd -- the LDN station channel -- to the discovered
@@ -1480,14 +1864,6 @@ namespace ams::mitm::bsd {
                 out_errno.SetValue(EIO);
                 return ResultSuccess();
             }
-
-            struct sockaddr_in dst_sin{};
-            if (addr.GetSize() >= sizeof(dst_sin)) {
-                std::memcpy(&dst_sin, addr.GetPointer(), sizeof(dst_sin));
-            }
-            u32 dst_ip = ntohl(dst_sin.sin_addr.s_addr);
-            u16 dst_port = ntohs(dst_sin.sin_port);
-            if (dst_port == 0) dst_port = LdnControlPort; // ldn_mitm always targets 11452; defensive fallback
 
             u32 our_isn = 0;
             ams::os::GenerateRandomBytes(std::addressof(our_isn), sizeof(our_isn));
@@ -1607,10 +1983,20 @@ namespace ams::mitm::bsd {
         // Poll answer from the virtual-TCP tunnel instead of the real
         // (never actually reachable) local listener the forward above just
         // harmlessly set up.
-        if (GetTrackedType(fd) == SOCK_STREAM) {
+        //
+        // Gated on fd == m_ldn_tcp_bind_fd (set in Bind(), only when this
+        // exact fd was bound to LdnControlPort as TCP) -- NOT just "any
+        // SOCK_STREAM fd got Listen()'d". That unconditional version used
+        // to hijack every mitm'd process's own real TCP listener (e.g.
+        // sys-ftpd's PASV data socket) once ShouldMitm covered more than
+        // ldn_mitm alone: Accept() below never falls back to real
+        // forwarding once a fd matches g_tcp_listen_fd, so a real,
+        // unrelated listener got permanently unable to accept real
+        // connections. Confirmed live -- this is what broke FTP.
+        if (fd >= 0 && fd == m_ldn_tcp_bind_fd) {
             std::scoped_lock lk(g_vtcp_mutex);
             g_tcp_listen_fd = fd;
-            LogFormat("BsdBridge: Listen(fd=%d) -- marked as the virtual TCP listener", fd);
+            LogFormat("BsdBridge: Listen(fd=%d) -- marked as the virtual TCP listener (was bound to LdnControlPort)", fd);
         }
         return rc;
     }

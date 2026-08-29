@@ -11,3 +11,7 @@ out/
 *.nacp
 *.map
 *.npdm
+
+# Python tools bytecode
+__pycache__/
+*.pyc

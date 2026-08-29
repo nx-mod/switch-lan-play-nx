@@ -1,6 +1,7 @@
 #pragma once
 #include <switch.h>
 #include <cstring>
+#include <cstdlib>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <fcntl.h>
@@ -484,9 +485,11 @@ namespace ams::slp {
                 if (part_len > chunk_data_len) return false;
 
                 ReassemblySlot *slot = nullptr;
+                bool is_existing_group = false;
                 for (auto &s : m_slots) {
                     if (s.used && s.id == id && std::memcmp(s.src_ip, hdr.src_ip, 4) == 0) {
                         slot = &s;
+                        is_existing_group = true; // already accumulating this group -- do NOT reset it below
                         break;
                     }
                 }
@@ -494,15 +497,53 @@ namespace ams::slp {
                     for (auto &s : m_slots) {
                         if (!s.used) {
                             slot = &s;
-                            slot->used = true;
-                            slot->id = id;
-                            slot->part_mask = 0;
-                            std::memcpy(slot->src_ip, hdr.src_ip, 4);
                             break;
                         }
                     }
                 }
-                if (!slot) return false; // all reassembly slots busy; drop
+                if (!slot) {
+                    // Every slot is busy. Ported from the original
+                    // switch-lan-play PC client (src/lan-client.c, commit
+                    // e2071ab): don't evict indiscriminately (a plain
+                    // round-robin could throw out a group that's still
+                    // actively, legitimately arriving, just to make room --
+                    // exactly the "don't discard something we still need"
+                    // failure a blind rotation risks). Fragment ids
+                    // increment monotonically per send, so the distance
+                    // between a slot's id and the last id that actually
+                    // completed is a free staleness signal with no clock
+                    // needed: only the SINGLE most-stale slot is even a
+                    // candidate, and only if that drift clears a real
+                    // threshold (10 -- same constant upstream uses). Below
+                    // that, every slot is plausibly still in flight, so the
+                    // new fragment is simply dropped instead (this
+                    // transport already tolerates packet loss elsewhere).
+                    int max_dist = 0;
+                    ReassemblySlot *to_evict = nullptr;
+                    for (auto &s : m_slots) {
+                        if (!s.used) continue;
+                        int dist = std::abs(static_cast<int>(s.id) - static_cast<int>(m_most_success_frag_id));
+                        if (dist > max_dist) {
+                            max_dist = dist;
+                            to_evict = &s;
+                        }
+                    }
+                    if (to_evict != nullptr && max_dist > 10) {
+                        slot = to_evict;
+                    } else {
+                        return false; // every slot plausibly still in flight -- drop rather than risk discarding a live one
+                    }
+                }
+                if (!is_existing_group) {
+                    // Claiming a fresh slot (free, or just evicted) -- only
+                    // reset state here. An existing in-progress group must
+                    // keep accumulating into what it already has.
+                    slot->used = true;
+                    slot->id = id;
+                    slot->part_mask = 0;
+                    slot->total_len = 0;
+                    std::memcpy(slot->src_ip, hdr.src_ip, 4);
+                }
 
                 if (hdr.part >= 32 || static_cast<size_t>(hdr.part) * pmtu + part_len > sizeof(slot->buffer)) {
                     slot->used = false;
@@ -524,6 +565,7 @@ namespace ams::slp {
                     std::memcpy(out_buf, slot->buffer, slot->total_len);
                     *out_len = slot->total_len;
                     slot->used = false;
+                    m_most_success_frag_id = id; // staleness reference point for the eviction check above
                     return true;
                 }
                 return false;
@@ -541,10 +583,33 @@ namespace ams::slp {
                 u8 src_ip[4] = {};
                 u32 part_mask = 0;
                 size_t total_len = 0;
-                u8 buffer[RELAY_MTU * 32];
+                // Was RELAY_MTU * 32 (44,800 B/slot, 179KB total across
+                // NUM_SLOTS) -- an arbitrary "big enough to never worry
+                // about it" figure with no real basis. The largest payload
+                // this project actually ever sends fragmented is
+                // MaxBridgedPayload in bsd_bridge_service.cpp (2048 B,
+                // ldn_mitm's own LanSocket::BufferSize ceiling); 4 fragments
+                // is 2.7x that with real headroom for growth, not 22x.
+                // Right-sized after noticing this while comparing against a
+                // sibling project's own reassembly slot sizing (dogty's
+                // FragSlot::buffer[1600], correctly scoped to ITS smaller
+                // per-packet ceiling) -- same category of unnecessary
+                // static allocation as the bug that crashed the console
+                // earlier tonight, just global/singleton here rather than
+                // multiplied per-process, so lower stakes but still worth
+                // fixing while in this code.
+                u8 buffer[RELAY_MTU * 4];
             };
             static constexpr int NUM_SLOTS = 4;
             ReassemblySlot m_slots[NUM_SLOTS];
+            // ID of the most recently SUCCESSFULLY completed reassembly --
+            // ported from the original switch-lan-play PC client's own
+            // lan_client_process_frag (src/lan-client.c, commit e2071ab
+            // "decode frag"): fragment ids increment monotonically per
+            // SendFragmented call, so distance from this value is a free
+            // staleness proxy with no clock needed. See ReassembleFrag's
+            // own comment for how it's used.
+            u16 m_most_success_frag_id = 0;
 
             // ---- inbound queue + pump thread ---------------------------------
             static constexpr s32 PumpThreadPriority = 6; // same tier as the mitm server threads in main.cpp

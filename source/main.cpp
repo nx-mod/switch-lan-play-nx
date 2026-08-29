@@ -125,11 +125,17 @@ namespace ams {
                 static constexpr bool   CanManageMitmServers  = true;
             };
 
-            // Needs headroom beyond the 2 always-active sessions
-            // (g_bsdSrv + g_bsdMonitor) for ldn_mitm alone: other processes'
-            // declined bsd:u connection attempts (ShouldMitm=no) interleave
-            // in the same window every boot.
-            constexpr size_t MaxSessions = 16;
+            // ShouldMitm (bsd_bridge_service.cpp) now accepts every
+            // process's bsd:u session, not just ldn_mitm's -- a game's own
+            // gameplay socket needs to be visible here too (see that file's
+            // own header comment). That means a session per bsd:u client
+            // process actually STAYS OPEN for as long as that process is
+            // running, not just momentarily during boot's declined-attempt
+            // interleaving (the old rationale for 16). A live console can
+            // easily have qlaunch/the current game plus several background
+            // sysmodules with their own bsd:u sessions concurrently; sized
+            // generously rather than risk a real client getting refused.
+            constexpr size_t MaxSessions = 48;
 
             class ServerManager final : public sf::hipc::ServerManager<1, BsdBridgeManagerOptions, MaxSessions> {
                 private:
