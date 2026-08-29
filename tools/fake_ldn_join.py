@@ -87,6 +87,11 @@ def main():
                           "early or hold indefinitely with a very large value -- this is what "
                           "gives switch-lan-play-nx's own bridge time to actually exchange "
                           "data with the real host, not just complete the handshake.")
+    ap.add_argument("--exchange-interval", type=float, default=0.5,
+                     help="seconds between each ongoing send/receive exchange against the "
+                          "host after joining (default: 0.5). The joiner keeps re-sending its "
+                          "own node state over the per-station TCP session AND drains whatever "
+                          "the host broadcasts back -- real two-way traffic, not just idle.")
     args = ap.parse_args()
 
     lcid = int(args.lcid, 16)
@@ -146,11 +151,21 @@ def main():
                   f"connected={n['is_connected']} lcv={n['lcv']}")
 
         print(f"[fake-join] holding connection for {args.hold}s "
-              f"(sending keepalives; Ctrl-C to stop early)...")
+              f"(exchanging both ways with the host; Ctrl-C to stop early)...")
         end = time.time() + args.hold
         while time.time() < end:
-            node.keepalive()
-            time.sleep(2)
+            # Ongoing two-way exchange: keep re-sending our own node state to the
+            # host over the per-station TCP session AND drain anything the host
+            # broadcasts/sends back -- so we're genuinely RECEIVING, not just
+            # idling ("send and wait, nothing returned").
+            before = node.lan_events
+            node.station_exchange()
+            recv = node.lan_events - before
+            node.recv_next()
+            print(f"[fake-join] exchange both ways "
+                  f"(sent node state, drained {recv} event(s) from host), "
+                  f"state={node.state}")
+            time.sleep(args.exchange_interval)
             if node.state != ldn.STATE_STATION_CONNECTED:
                 print(f"[fake-join] dropped out of STATION_CONNECTED "
                       f"(now state={node.state}, disconnect_reason={node.disconnect_reason})")

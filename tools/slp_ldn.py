@@ -531,7 +531,9 @@ class LdnNode:
         self.stations = {}                # host side: node_id -> dict
         self.lan_events = 0
         self.recv_srcs = []               # (src_ip, dst_ip, ptype) debug log
-
+        self.send_count = 0
+        self.recv_count = 0
+        self.exchange_log = []            # ordered [(ts, dir, role, ptype, nbytes, src, dst)]
         self._vtcp = {}                   # peer_ip bytes -> VTcp
         self._vtcp_lock = threading.Lock()
 
@@ -550,6 +552,48 @@ class LdnNode:
         # thread; mirror that with an auto-step thread so hosts reply to
         # Scan/Connect without the test having to pump them.
         threading.Thread(target=self._auto_step, daemon=True).start()
+
+    PTYPE_NAMES = {LAN_SCAN: "Scan", LAN_SCAN_RESP: "ScanResp",
+                   LAN_CONNECT: "Connect", LAN_SYNC_NETWORK: "SyncNetwork"}
+
+    def log_pkt(self, direction, ptype, nbytes, src=None, dst=None):
+        """Trace every send/receive so we can watch the full joiner<->hoster
+        exchange from the Python side -- packet type, direction, byte count,
+        and (when known) which two parties are talking. This is the primary
+        visibility tool for 'get the exchange as far as we can then relog':
+        we see right here exactly what each side sends and receives with both
+        names in both roles."""
+        role = "HOST" if self.state in (STATE_ACCESS_POINT,
+                                        STATE_ACCESS_POINT_CREATED) else \
+            ("JOIN" if self.state in (STATE_STATION, STATE_STATION_CONNECTED) else "?")
+        name = self.PTYPE_NAMES.get(ptype, f"type{ptype}")
+        src_s = ".".join(map(str, src)) if src is not None and len(src) == 4 else "?"
+        dst_s = ".".join(map(str, dst)) if dst is not None and len(dst) == 4 else "?"
+        line = (f"{time.strftime('%H:%M:%S')} [{role}:{self.name}] "
+                f"{direction:4} {name:11} {nbytes:5}B  src={src_s} dst={dst_s}")
+        print(line)
+        self.exchange_log.append((time.time(), direction, role, name, nbytes, src_s, dst_s))
+        if direction == "SEND":
+            self.send_count += 1
+        else:
+            self.recv_count += 1
+
+    def recv_next(self):
+        """Drain one frame from the inbound queue and log it, so a station can
+        visibly RECEIVE what the host sends back (not just keepalive)."""
+        with self._inbox_lock:
+            if not self._inbox:
+                self.log_pkt("RECV", -1, 0)
+                return None
+            batch = self._inbox
+            self._inbox = []
+        for src, dst, payload in batch:
+            pkt = unpack_packet(payload)
+            ptype = pkt[0] if pkt is not None else -1
+            self.log_pkt("RECV", ptype, len(payload), src, dst)
+            self.recv_srcs.append((src, dst, ptype))
+            self._handle_packet(src, payload)
+        return batch
 
     def close(self):
         """Stop threads + close the socket so the node leaves the room."""
@@ -652,6 +696,62 @@ class LdnNode:
 
     def keepalive(self):
         self.sock.sendto(bytes([0x00]), self.server)
+
+    def broadcast_network(self):
+        """Host role: broadcast the current NetworkInfo as a SyncNetwork to
+        the whole LDN subnet (via the relay's UDP broadcast), exactly like a
+        real host re-announces its network every ~1s. This is the ongoing
+        'back and forth' the fake host needs to keep sending -- the real
+        console's host broadcasts this 1152-byte frame periodically, and a
+        fake joiner that only ever sent one SyncNetwork on connect and then
+        went idle would give the console nothing to receive. Returns the
+        number of bytes sent (0.0 for keepalive-only)."""
+        body = self._network_bytes()
+        n = len(body)
+        bcast = bytes([self.ip[0], self.ip[1], self.ip[2], 255])
+        self.send_control(bcast, pack_header(LAN_SYNC_NETWORK, body))
+        self.log_pkt("SEND", LAN_SYNC_NETWORK, n, self.ip, bcast)
+        return n
+
+    def station_exchange(self):
+        """Both roles: the per-station session's ongoing data exchange.
+        Host: re-send SyncNetwork over every connected station's TCP
+        connection so the joiner keeps receiving fresh node state. Station:
+        re-send its NodeInfo (Connect-shaped) so the host keeps seeing the
+        player as alive. Mirrors ldn_mitm's periodic per-station traffic so
+        neither side 'sends and waits with nothing returned'. Returns the
+        number of bytes pushed to peers."""
+        sent = 0
+        if self.state == STATE_ACCESS_POINT_CREATED:
+            nids = [nid for nid, s in self.stations.items() if s["connected"]]
+            for nid in nids:
+                st = self.stations[nid]
+                vtcp = st.get("vtcp")
+                if vtcp is None:
+                    continue
+                body = self._network_bytes()
+                try:
+                    vtcp.send(pack_header(LAN_SYNC_NETWORK, body))
+                except Exception:  # noqa: BLE001  peer gone; drop and continue
+                    st["connected"] = False
+                    self._update_nodes()
+                    continue
+                sent += len(body)
+                self.log_pkt("SEND", LAN_SYNC_NETWORK, len(body), self.ip, st["ip"])
+        elif self.state == STATE_STATION_CONNECTED and self.host_network is not None:
+            host_ip = self.host_network["nodes"][0]["ip"]
+            vtcp = self._vtcp.get(bytes(host_ip))
+            if vtcp is not None:
+                try:
+                    my = build_node_info(self.ip, 0, 1, self.name,
+                                         self.host_network["nodes"][0]["lcv"])
+                    vtcp.send(pack_header(LAN_CONNECT, my))
+                except Exception:  # noqa: BLE001
+                    return sent
+                sent += NODE.size
+                self.log_pkt("SEND", LAN_CONNECT, NODE.size, self.ip, host_ip)
+            self.recv_next()
+        return sent
 
     def send_control(self, dst, payload):
         udp = struct.pack("!HHHH", self.port, self.port, 8 + len(payload), 0) + payload
@@ -870,6 +970,7 @@ class LdnNode:
         if pkt is None:
             return
         ptype, body = pkt
+        self.log_pkt("RECV", ptype, len(payload), src_ip, None)
         if ptype == LAN_SCAN:
             if self.state == STATE_ACCESS_POINT_CREATED:
                 self.send_unicast(src_ip, LAN_SCAN_RESP, self._network_bytes())

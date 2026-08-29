@@ -50,7 +50,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "spike"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import slp_ldn as ldn
 
 
@@ -107,6 +107,11 @@ def main():
                           "confirmed to produce MK8DX's own \"software versions don't "
                           "match\" join error -- its real CreateNetwork was captured at "
                           "lcv=14, not this tool's default of 6.")
+    ap.add_argument("--exchange-interval", type=float, default=0.5,
+                     help="seconds between each periodic SyncNetwork broadcast + "
+                          "per-station exchange (default: 0.5). Both directions, so "
+                          "the console always has fresh node state to receive -- "
+                          "the whole point of 'back and forth' (default: 0.5)")
     args = ap.parse_args()
 
     lcid = int(args.lcid, 16)
@@ -180,8 +185,16 @@ def main():
     last_node_count = node.network_info.get("node_count", 1)
     try:
         while True:
-            node.keepalive()
-            time.sleep(2)
+            # Ongoing two-way exchange: periodically re-announce the network on
+            # the control broadcast AND re-send SyncNetwork over every connected
+            # station's TCP session, so the console's joiner keeps getting fresh
+            # node state instead of "sends and waits, nothing returned".
+            if node.state == ldn.STATE_ACCESS_POINT_CREATED:
+                n_sent = node.broadcast_network()
+                node.station_exchange()
+                print(f"[fake-host] exchange: broadcast SyncNetwork ({n_sent}B) "
+                      f"+ {len([s for s in node.stations.values() if s['connected']])} station(s)")
+            time.sleep(args.exchange_interval)
             cur_count = node.network_info.get("node_count", 1)
             if cur_count != last_node_count:
                 print(f"[fake-host] node_count changed {last_node_count} -> {cur_count}")
@@ -192,6 +205,11 @@ def main():
                     print(f"    node {n['node_id']}: {n['name']!r} @ {ip} "
                           f"connected={n['is_connected']} lcv={n['lcv']}")
                 last_node_count = cur_count
+
+            if node.state != ldn.STATE_ACCESS_POINT_CREATED:
+                print(f"[fake-host] dropped out of ACCESS_POINT_CREATED "
+                      f"(state={node.state}) - stopping")
+                break
     except KeyboardInterrupt:
         print("\n[fake-host] stopping")
     finally:
