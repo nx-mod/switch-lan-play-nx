@@ -87,11 +87,13 @@ def main():
                           "early or hold indefinitely with a very large value -- this is what "
                           "gives switch-lan-play-nx's own bridge time to actually exchange "
                           "data with the real host, not just complete the handshake.")
-    ap.add_argument("--exchange-interval", type=float, default=0.5,
+    ap.add_argument("--exchange-interval", type=float, default=0.43,
                      help="seconds between each ongoing send/receive exchange against the "
-                          "host after joining (default: 0.5). The joiner keeps re-sending its "
-                          "own node state over the per-station TCP session AND drains whatever "
-                          "the host broadcasts back -- real two-way traffic, not just idle.")
+                          "host after joining (default: 0.43, matching the real console's "
+                          "measured joiner Connect cadence of ~430ms). The joiner keeps "
+                          "re-sending its own node state over the per-station TCP session AND "
+                          "drains whatever the host broadcasts back -- real two-way traffic, "
+                          "not just idle.")
     args = ap.parse_args()
 
     lcid = int(args.lcid, 16)

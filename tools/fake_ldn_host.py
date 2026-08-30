@@ -107,11 +107,13 @@ def main():
                           "confirmed to produce MK8DX's own \"software versions don't "
                           "match\" join error -- its real CreateNetwork was captured at "
                           "lcv=14, not this tool's default of 6.")
-    ap.add_argument("--exchange-interval", type=float, default=0.5,
+    ap.add_argument("--exchange-interval", type=float, default=0.43,
                      help="seconds between each periodic SyncNetwork broadcast + "
-                          "per-station exchange (default: 0.5). Both directions, so "
-                          "the console always has fresh node state to receive -- "
-                          "the whole point of 'back and forth' (default: 0.5)")
+                          "per-station exchange (default: 0.43, matching the real console's "
+                          "measured joiner Connect cadence of ~430ms -- the host replies to "
+                          "each with a fresh SyncNetwork ~80ms later). Both directions, so "
+                          "the console always has fresh node state to receive -- the whole "
+                          "point of 'back and forth'.")
     args = ap.parse_args()
 
     lcid = int(args.lcid, 16)
