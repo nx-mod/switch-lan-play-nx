@@ -1,0 +1,131 @@
+# switch-lan-play-nx — tools/ usage notes
+
+Each tool in this directory, what it does, and how to run it. Run from the
+repo root (`C:\PROJECTS\switch\switch-cfw\switch-lan-play-nx`) or from
+`tools/` with `python tools/<name>.py`.
+
+The relay defaults: fake_ldn_host / fake_ldn_join / run_permutations use
+`--relay 127.0.0.1 --port 11451` (the local `slp-server-rust`). Pass
+`--relay 10.233.41.153` to reach the console host's relay instead.
+
+Two "planes" of LAN play are emulated here:
+  - LDN control plane (fake_ldn_host/join, slp_ldn): scan/connect/SyncNetwork,
+    the lobby discovery that switch-lan-play-nx's bsd bridge passes through.
+  - Pia session plane (slp_fake_player, slp_pia, slp_lan, test_lan): the
+    in-game browse + encrypted session traffic on UDP 49152-49155.
+
+---
+
+## fake_ldn_host.py
+Host a fake LDN lobby for any title, over a real slp relay OR ZeroTier
+(`--zt-ip`). Built on `LdnNode` (slp_ldn.py). Consolidates the old per-game
+hosts (D3 / Torchlight II / WWZ).
+
+Usage:
+    python3 tools/fake_ldn_host.py 0x0100152000022000 --name Link \
+        --relay 127.0.0.1 --port 11451 --ip 10.13.200.77 \
+        --lcv 14 --security-mode 1 --mk8dx-appdata --exchange-interval 0.43
+
+Key flags:
+  --mk8dx-appdata   fill the 152-byte advertise-data block with the real
+                    MK8DX session template (Link / DEV-TESTS names), matching
+                    the console capture byte-for-byte.
+  --exchange-interval  seconds between SyncNetwork broadcast + per-station
+                    exchange. Default 0.43 (console joiner Connect cadence).
+  --relay / --port  / --ip (your fake LAN ip, host usually .77).
+
+## fake_ldn_join.py
+Join a fake (or real) LDN lobby as a station. Scans by local_comm_id, connects
+to the first match, reports resulting NetworkInfo. Counterpart to
+fake_ldn_host.py.
+
+Usage:
+    python3 tools/fake_ldn_join.py 0x0100152000022000 --name DEV-TESTS \
+        --relay 127.0.0.1 --port 11451 --ip 10.13.200.78 --hold 30
+
+Key flags:
+  --hold          seconds to keep exchanging after joining (Ctrl-C to stop).
+  --exchange-interval  seconds per two-way exchange; default 0.43 (console).
+  --index         pick which scanned lobby to join if several match.
+  Note: --lcv is NOT a join arg; the joiner inherits the host's lcv.
+
+## run_permutations.py
+Reusable driver for the "recreate the 4 joins" workflow: starts a
+fake_ldn_host as one player/role and a fake_ldn_join as the other, holds them
+against a relay for a bounded time, tears down, and reports whether the join
+reached StationConnected and the two-way exchange ran. Great for isolating a
+fake-pair before involving the console.
+
+Usage:
+    python3 tools/run_permutations.py \
+        --lcid 0x0100152000022000 --relay 127.0.0.1 --port 11451 \
+        --host Link --join DEV-TESTS --hold 6
+    # loop several pairs:
+    python3 tools/run_permutations.py --loop Link:DEV-TESTS DEV-TESTS:Link
+
+Host/join IPs are fixed to 10.13.200.77 (host) and .78 (join).
+
+## log_study.py
+Log analysis helpers: pulls packet dumps out of a console's
+`ldn_mitm.log` / `switch-lan-play-nx.log` and compares them byte-for-byte
+against packets built by slp_ldn. Proves "the fake sends exactly what the
+console sends" against the console's own captures (ground truth).
+
+Functions: iter_dumps(path), get_dump(path, ts), annotate(buf),
+build_network_info_from(appdata, name, ip), compare_nwinfo(name, ip, cap_ts,
+log_path).
+
+Example:
+    from log_study import compare_nwinfo
+    built, captured, mismatches = compare_nwinfo('Link', [10,13,200,77],
+                                                 1859348, 'ldn_mitm.log')
+    # mismatches == [] -> byte-identical to the console's 1152B SyncNetwork.
+
+Key facts it encodes:
+  - advertiseData sits at NETWORK offset 0x26C (LdnNetworkInfo 0x21C + 0x50).
+  - The struct layouts in slp_ldn.py match spacemeowx2/ldn_mitm exactly
+    (LDN=0x430, NODE=0x40, COMMON=0x30, NETWORK=0x480, SSID=0x22). Emulator
+    (yuzu/eden/Ryujinx) structs are byte-identical too; their named fields
+    (has_action_frame, random_authentication_id) are just ldn_mitm's _unk.
+
+## slp_ldn.py
+The LDN control-plane codec + virtual console state machine. Byte-exact port
+of ldn_mitm's lan_protocol.cpp / lan_discovery.cpp over the slp relay. Defines
+LANPacketHeader, NetworkInfo, NodeInfo codecs; the scan/connect/SyncNetwork
+state machine; `broadcast_network`, `station_exchange`, `recv_next`, and
+`log_pkt` for the two-way per-station exchange. Library, not a script.
+
+## slp_lan.py
+Pia "LAN Protocol" browse request/reply codec + crypto (5.7+ challenge), per
+kinnay/NintendoClients wiki. Big-endian wire layouts. Used by slp_fake_player
+and test_lan. Library.
+
+## slp_pia.py
+Pia session-layer emulation for LAN mode (Pia 5.7+): browse + crypto challenge
++ session-key derivation + AES-GCM session traffic, all over the slp relay, no
+console needed. Enables fully-local two-player lobby create/join.
+
+## slp_fake_player.py
+Laptop "fake LAN player" for MK8DX end-to-end: acts as an MK8DX LAN-mode room
+HOST over the slp relay (Pia :30000 browse protocol). Verifies the relay ->
+tunnel -> console path for LAN-mode browsing.
+
+## slp_spike.py
+M1 protocol spike: validates the switch-lan-play (slp) relay wire format
+against slp-server-rust with two simulated players (Keepalive / Ping / Ipv4 /
+Ipv4Frag / AuthMe).
+
+## test_lan.py
+Local test suite for the Pia LAN browse + session emulation. Runs unit tests
+(crypto challenge round-trip, session-key derivation, AES-GCM) and a live
+two-player end-to-end over slp-server-rust. "Start game" is NOT testable
+locally (needs real consoles).
+
+Usage: python3 tools/test_lan.py [relay_host] [relay_port]
+
+## demo_host.py / demo_join.py
+Older cross-plane demo: host/join a demo MK8DX lobby (both WiFi/LDN and LAN
+mode) against the relay. Superseded for most work by the split LDN/Pia tools.
+
+Usage: python3 tools/demo_host.py [relay_ip] [relay_port]
+       python3 tools/demo_join.py [relay_ip] [relay_port]
