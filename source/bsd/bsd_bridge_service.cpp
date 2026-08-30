@@ -70,6 +70,27 @@ namespace ams::mitm::bsd {
         // g_relay's socket is a real use-after-close.
         ams::os::SdkMutex g_relay_mutex;
 
+        // --- per-pid dummy-session skip for intercepted APPS -----------------
+        // A game (MK8DX, and most other titles) opens a dummy first bsd:u
+        // session that never calls RegisterClient and crashes if intercepted
+        // even when handled gracefully -- the very first session of each
+        // "burst" of bsd:u activity must be forwarded transparently, and only
+        // session #2+ intercepted. Each pid-burst: dummy first time through,
+        // then the live count rises; once the pid's live count drops back to
+        // zero (all its sessions closed) the pid is forgotten so the next
+        // burst (e.g. WiFi -> Finalize -> LAN) skips its dummy again.
+        // Only tracked for APPLICATION sessions (never ldn_mitm's own control
+        // channel, which has no dummy). Fixed-size table -- a handful of pids
+        // at most -- matching this project's zero-heap, static-array style.
+        struct DummySkipEntry {
+            u64 pid = 0;
+            u32 live = 0;          // number of LIVE (intercepted) services for this pid right now
+            bool dummy_skipped = false; // whether this burst's dummy was already forwarded
+        };
+        constexpr size_t MaxDummySkipEntries = 8;
+        DummySkipEntry g_dummy_skip[MaxDummySkipEntries];
+        ams::os::SdkMutex g_dummy_skip_mutex;
+
         // Watchdog: a game can force-close without calling ldn:u's own
         // Finalize()/CloseAccessPoint()/DestroyNetwork(), leaving the
         // underlying session alive indefinitely -- the normal teardown path
@@ -368,11 +389,11 @@ namespace ams::mitm::bsd {
         // messages, not bulk transfer): no retransmission timer or
         // congestion control on OUR side (a real peer's own TCP stack already
         // retransmits on its own timeout if we don't ACK in time -- see the
-        // "don't ack if inbox already full" note below); no out-of-order
-        // reassembly (a mismatched seq is just dropped, relying on the peer's
-        // own retransmit); single-slot inbox per connection (matches
-        // ldn_mitm's own send-then-wait-for-exactly-one-reply usage pattern
-        // for this socket).
+        // "no room left" note below); no out-of-order reassembly (a
+        // mismatched seq is just dropped, relying on the peer's own
+        // retransmit). The receive side IS a proper byte stream though --
+        // segments append and short reads consume partially -- because
+        // ldn_mitm reassembles LAN packets itself and depends on that.
         constexpr u8 TCP_FIN = 0x01, TCP_SYN = 0x02, TCP_RST = 0x04, TCP_PSH = 0x08, TCP_ACK = 0x10;
 
         // VTcpConn/PendingAccept/MaxVTcpConns/MaxPendingAccepts/VTcpInboxCap
@@ -470,6 +491,42 @@ namespace ams::mitm::bsd {
             if (12u + length > payload_len) return; // truncated/split across segments -- skip
             LogFormat("BsdBridge: LDN %s type=%s len=%u compressed=%u decompress_len=%u",
                 direction, LdnPacketTypeName(type), length, compressed, decompress_length);
+        }
+
+        // Temporary diagnostic: hex-dump the first bytes of UDP traffic on a
+        // bridged socket that ISN'T ldn_mitm's own control channel (i.e. a
+        // game's own gameplay socket, bridged via is_ldn_subnet_match). We
+        // don't know what this traffic actually is yet (Pia session data,
+        // something else entirely, or a port we shouldn't be bridging at
+        // all) -- this exists purely to find out, not for any routing
+        // decision. Capped at 64 bytes so it can't blow up the log.
+        void LogNonControlUdpPayload(const char *direction, u16 local_port, const u8 *payload, size_t payload_len) {
+            if (local_port == LdnControlPort) return;
+            // LogFormat's own internal buffer is 256 bytes for the WHOLE
+            // formatted line (source/debug.cpp: char buf[0x100]) -- the
+            // earlier single-line version (up to 64 bytes -> 192 hex chars
+            // plus a ~60-byte prefix) could exceed that and get silently
+            // truncated mid-write, corrupting the log file itself (a stray
+            // embedded NUL partway through a line, garbling whatever came
+            // after it -- caught via `rg` reporting "binary file matches").
+            // Cap raised to 224 bytes (comfortably covers every payload
+            // size observed so far, up to 196B) and split into 16-byte
+            // chunks per LogFormat call so no single call gets anywhere
+            // near the buffer limit, regardless of total payload size.
+            constexpr size_t MaxCapture = 224;
+            constexpr size_t BytesPerLine = 16;
+            size_t n = payload_len < MaxCapture ? payload_len : MaxCapture;
+            LogFormat("BsdBridge: non-control UDP %s (local port %u) %zu bytes%s",
+                direction, local_port, payload_len, payload_len > MaxCapture ? " (truncated for log)" : "");
+            for (size_t off = 0; off < n; off += BytesPerLine) {
+                size_t line_n = (n - off) < BytesPerLine ? (n - off) : BytesPerLine;
+                char hex[BytesPerLine * 3 + 1];
+                for (size_t i = 0; i < line_n; i++) {
+                    std::snprintf(hex + i * 3, 4, "%02x ", payload[off + i]);
+                }
+                hex[line_n * 3 > 0 ? line_n * 3 - 1 : 0] = '\0';
+                LogFormat("BsdBridge:   [%04zx] %s", off, hex);
+            }
         }
 
         // Builds and sends one raw IPv4/TCP segment via the relay.
@@ -605,8 +662,25 @@ namespace ams::mitm::bsd {
         // Safety net alongside Close()'s own clearing below: whatever the
         // teardown path was, this instance must never be left as the
         // background drain thread's target once it's gone.
-        std::scoped_lock lk(g_relay_mutex);
-        if (g_active_ldn_instance == this) g_active_ldn_instance = nullptr;
+        {
+            std::scoped_lock lk(g_relay_mutex);
+            if (g_active_ldn_instance == this) g_active_ldn_instance = nullptr;
+        }
+        // Dummy-skip bookkeeping: this is a LIVE (intercepted, session #2+)
+        // instance for its pid. When the last one closes, forget the pid and
+        // re-arm the dummy-skip so the next burst (a fresh process id) skips
+        // its new dummy first session the same way. See g_dummy_skip.
+        {
+            std::scoped_lock lk(g_dummy_skip_mutex);
+            for (size_t i = 0; i < MaxDummySkipEntries; i++) {
+                DummySkipEntry &e = g_dummy_skip[i];
+                if (e.pid == m_client_info.process_id.value && e.live > 0) {
+                    e.live--;
+                    if (e.live == 0) { e.pid = 0; e.dummy_skipped = false; }
+                    break;
+                }
+            }
+        }
     }
 
     slp::RelayBridge &BsdBridgeService::GetRelay() { return g_relay; }
@@ -775,19 +849,23 @@ namespace ams::mitm::bsd {
             // actually lost, no action needed on our side.
             return;
         }
-        if (c->inbox_ready) {
-            // Unconsumed data already queued -- do NOT ack, so the peer's
-            // real TCP stack retransmits once its timer fires (correct
-            // backpressure, not a bug).
-            return;
-        }
         if (payload_len > VTcpInboxCap) {
             LogFormat("BsdBridge: TCP data from 0x%08x:%u len=%zu too big, dropped", src_ip, src_port, payload_len);
             return;
         }
-        std::memcpy(c->inbox, payload, payload_len);
-        c->inbox_len = payload_len;
-        c->inbox_ready = true;
+        if (c->inbox_len + payload_len > VTcpInboxCap) {
+            // No room left -- do NOT ack, so the peer's real TCP stack
+            // retransmits once its timer fires (correct backpressure, not a
+            // bug). Appending rather than holding a single segment means this
+            // now only fires when ldn_mitm is genuinely behind, instead of on
+            // every second segment of a back-to-back pair (a Switch's initial
+            // RTO is ~200ms-1s with exponential backoff, and the join path
+            // sends two SyncNetworks in quick succession -- Connect ->
+            // updateNodes, then SetAdvertiseData -> updateNodes).
+            return;
+        }
+        std::memcpy(c->inbox + c->inbox_len, payload, payload_len);
+        c->inbox_len += payload_len;
         c->their_seq += static_cast<u32>(payload_len);
         SendTcpSegment(local_ip, src_ip, LdnControlPort, src_port,
             c->our_seq, c->their_seq, TCP_ACK, nullptr, 0);
@@ -927,50 +1005,110 @@ namespace ams::mitm::bsd {
     }
 
     bool BsdBridgeService::ShouldMitm(const sm::MitmProcessInfo &client_info) {
-        // REVERTED to ldn_mitm-only. Widening this to (almost) everyone --
-        // see this file's header comment for the reasoning (a game's own
-        // gameplay socket is a separate process from ldn_mitm and normally
-        // invisible here) -- was tried twice and caused two separate live
-        // incidents even after fixing the bug each one exposed:
+        // The ldn_mitm control channel is only half the picture: a game's
+        // own gameplay socket is a SEPARATE process (own program_id) that a
+        // ldn_mitm-only ShouldMitm never sees, so its actual gameplay data
+        // (Pia session, UDP 49152) silently falls into a real interface not
+        // on the peer's network -- the lobby joins but the game never
+        // renders the peer. Widening to (almost) everyone was tried twice
+        // and each exposed a real bug (fixed below), but the crashes were
+        // really from mitm'ing EVERY process -- qlaunch, background
+        // sysmodules, the game, even homebrew-in-applet mode -- not from
+        // mitm'ing the game.
         //
-        // Attempt 1 broke the FTP server: the vtcp connection-tracking
-        // state (g_vtcp_conns, g_tcp_listen_fd, g_pending_accepts, the
-        // fd-type-tracking tables) were file globals shared across every
-        // mitm'd process, safe only when ldn_mitm was the sole one ever
-        // bridged -- fds are a PER-PROCESS numbering space, so sys-ftpd's
-        // own fd numbers could collide with ldn_mitm's tracked ones. Worse,
-        // Listen()/Connect() triggered their virtual-TCP paths off "is this
-        // fd a SOCK_STREAM socket" alone, with no port check at all -- ANY
-        // mitm'd process's own real TCP listen/connect got permanently
-        // hijacked, whether or not any fd number ever collided. Fixed by
-        // moving the vtcp state onto the instance itself.
+        // History of the two live incidents, both now fixed:
+        //  Attempt 1 broke the FTP server: the vtcp connection-tracking
+        //  state (g_vtcp_conns, g_tcp_listen_fd, g_pending_accepts, the
+        //  fd-type-tracking tables) were file globals shared across every
+        //  mitm'd process -- fds are a PER-PROCESS numbering space, so
+        //  sys-ftpd's own fd numbers could collide with ldn_mitm's tracked
+        //  ones, and Listen()/Connect() treated "any SOCK_STREAM fd" as
+        //  virtual-TCP with no port check, hijacking every mitm'd process's
+        //  real TCP. Fixed by moving the vtcp state onto the instance.
+        //  Attempt 2 (per-instance) exhausted this sysmodule's heap: that
+        //  state carries ~37KB, duplicated onto EVERY mitm'd process.
+        //  Fixed by moving it back to a single shared copy gated by
+        //  ownership (g_active_ldn_instance) instead of duplicated.
+        //  With both fixed, real gameplay data bridged successfully for
+        //  minutes at a time, confirmed live.
         //
-        // Attempt 2 (the per-instance fix above) exhausted this
-        // sysmodule's heap instead: that state carries two 2KB buffers per
-        // slot (~37KB total), and duplicating it onto EVERY mitm'd process
-        // (qlaunch, background sysmodules, the game itself) crashed the
-        // console the moment the game's own process tried to connect.
-        // Fixed by moving the vtcp state back to a single shared copy,
-        // gated by ownership (g_active_ldn_instance) instead of duplicated.
-        //
-        // With BOTH of those fixed, real gameplay data did bridge
-        // successfully for extended stretches (minutes at a time,
-        // confirmed live) -- but a live console session that night still
-        // hit further instability (a crash following a Stop() call from
-        // the overlay, plus inconsistent join behavior) that wasn't
-        // isolated before deciding to stop testing on a daily-driver
-        // console for the night. The FindVTcpConnByFd/ByPeer/
-        // AllocVTcpConn/IsOwnTcpListenFd ownership-gating and the
-        // Bind()/Listen()/Connect() port-scoping all stay in place --
-        // reverting ONLY which processes ShouldMitm accepts, so this is a
-        // one-line, low-risk way back to the version that ran the whole
-        // night with zero crashes. Widening it again needs to happen with
-        // more controlled testing, not live on someone's daily driver.
+        // The resolve: accept ldn_mitm's own control channel PLUs real
+        // retail applications (not "everyone"), via
+        // ams::ncm::IsApplicationId(). That is the same guard the
+        // sys-slp-client project uses -- a hand-rolled 0x0100000000000000
+        // floor is wrong (it's the start of FIRMWARE SYSMODULES, not
+        // applications) and lets system applets (qlaunch, Album /
+        // homebrew-in-applet) through; IsApplicationId enforces the real
+        // application range 0x0100000000010000..0x01FFFFFFFFFFFFFF, so
+        // MK8DX (0x0100152000022000) is in and every system/applet/homebrew
+        // false positive is out. The per-fd Bind()/SendTo()/RecvFrom()
+        // logic already scopes actual interception to sockets on the LDN
+        // subnet, so a game's unrelated real internet traffic still passes
+        // through untouched.
         constexpr u64 LdnMitmProgramId = 0x4200000000000010ULL;
-        bool target = client_info.program_id.value == LdnMitmProgramId;
-        LogFormat("BsdBridge ShouldMitm: pid=%lu program_id=0x%016lx -> %s",
-            client_info.process_id.value, client_info.program_id.value, target ? "YES" : "no");
-        return target;
+
+        // ldn_mitm's own control channel is always bridged -- it has no dummy
+        // session, and without it nothing else works.
+        if (client_info.program_id.value == LdnMitmProgramId) {
+            LogFormat("BsdBridge ShouldMitm: pid=%lu program_id=0x%016lx -> YES (ldn_mitm)",
+                client_info.process_id.value, client_info.program_id.value);
+            return true;
+        }
+
+        // Applications only -- system services, applets and homebrew are out
+        // (see the comment above on why IsApplicationId, not a raw floor).
+        if (!ams::ncm::IsApplicationId(client_info.program_id)) {
+            LogFormat("BsdBridge ShouldMitm: pid=%lu program_id=0x%016lx -> no (not an application)",
+                client_info.process_id.value, client_info.program_id.value);
+            return false;
+        }
+
+        // Dummy-session skip (ported from sys-slp-client): a game opens a dummy
+        // first bsd:u session that never calls RegisterClient and freezes/
+        // aborts if intercepted -- closing its forward service unregistered is
+        // a system freeze. So per pid-burst the FIRST session is forwarded
+        // transparently (never constructed as a bridge service at all), and
+        // only session #2+ is intercepted. The pid is forgotten again once all
+        // its LIVE (intercepted) sessions close, so the next burst (e.g. WiFi
+        // -> Finalize -> LAN) skips its fresh dummy again. See g_dummy_skip.
+        u64 pid = client_info.process_id.value;
+
+        DummySkipEntry *entry = nullptr;
+        {
+            std::scoped_lock lk(g_dummy_skip_mutex);
+            for (size_t i = 0; i < MaxDummySkipEntries; i++) {
+                if (g_dummy_skip[i].pid == pid) { entry = &g_dummy_skip[i]; break; }
+                if (g_dummy_skip[i].pid == 0 && !g_dummy_skip[i].dummy_skipped && g_dummy_skip[i].live == 0 && entry == nullptr) {
+                    entry = &g_dummy_skip[i]; // first free slot
+                }
+            }
+            if (entry == nullptr) {
+                LogFormat("BsdBridge ShouldMitm: pid=%lu program_id=0x%016lx -> no (dummy-skip table full)",
+                    client_info.process_id.value, client_info.program_id.value);
+                return false;
+            }
+            if (entry->pid == 0) entry->pid = pid; // claim this free slot for the first time
+
+            if (!entry->dummy_skipped) {
+                // First session of this burst: it's the dummy -- forward it
+                // transparently, remember we did, and do NOT construct a
+                // bridge service for it (so its forward service is never
+                // closed unregistered).
+                entry->dummy_skipped = true;
+                LogFormat("BsdBridge ShouldMitm: pid=%lu program_id=0x%016lx -> no (dummy first session, forwarded transparently)",
+                    client_info.process_id.value, client_info.program_id.value);
+                return false;
+            }
+
+            // Real session (#2+): intercept it. Count it so the destructor can
+            // forget the pid once the last live session closes (re-arming the
+            // dummy-skip for the next burst).
+            entry->live++;
+        }
+
+        LogFormat("BsdBridge ShouldMitm: pid=%lu program_id=0x%016lx -> YES (application, %u live)",
+            client_info.process_id.value, client_info.program_id.value, entry->live);
+        return true;
     }
 
     // ---- generic forwarding helpers ---------------------------------------
@@ -1095,7 +1233,7 @@ namespace ams::mitm::bsd {
             return false;
         }
         VTcpConn *c = FindVTcpConnByFd(poll_fd); // nullptr if this instance doesn't own the shared vtcp state
-        return c != nullptr && (c->inbox_ready || c->peer_closed);
+        return c != nullptr && (c->inbox_len > 0 || c->peer_closed);
     }
 
     Result BsdBridgeService::Select(sf::Out<s32> out_count, sf::Out<s32> out_errno, const SelectInData &in_data,
@@ -1156,6 +1294,21 @@ namespace ams::mitm::bsd {
         }
 
         SelectInData forward_in = in_data;
+        {
+            // Same fix as Poll() (see its own comment): don't block the
+            // forwarded real select() for the caller's full timeout (or
+            // indefinitely, if is_null) when we already know relay/virtual
+            // data is sitting ready -- forward a zero, non-blocking timeout
+            // instead so already-ready data isn't delayed behind a real
+            // select() that has nothing of its own to report.
+            bool any_pending = false;
+            for (s32 fd = 0; fd < nfds && !any_pending; fd++) {
+                any_pending = VFdHasPendingRead(fd);
+            }
+            if (any_pending) {
+                forward_in.timeout = SelectTimeval{ .tv_sec = 0, .tv_usec = 0, .is_null = false };
+            }
+        }
         RetErrno out{};
         Result rc = serviceMitmDispatchInOut(m_forward_service.get(), 5, forward_in, out,
             .buffer_attrs = {
@@ -1203,6 +1356,15 @@ namespace ams::mitm::bsd {
     Result BsdBridgeService::Poll(sf::Out<s32> out_count, sf::Out<s32> out_errno, const sf::InAutoSelectBuffer &fds_in,
             sf::OutAutoSelectBuffer fds_out, s32 nfds, s32 timeout) {
         DrainRelay();
+
+        // Diagnostic: confirm what timeout the caller (ldn_mitm's own
+        // loopPoll -> Pollable::Poll, default 100ms) is actually asking
+        // for at this call site, rather than assuming it from source
+        // reading -- a real multi-second gap here could mean either the
+        // real forwarded poll() is legitimately slow despite a short
+        // request, or the caller is genuinely asking for something longer
+        // than expected.
+        LogFormat("BsdBridge: Poll(nfds=%d, timeout=%d) called", nfds, timeout);
 
         // Host-role accepted virtual connections have a SYNTHETIC fd (see
         // Accept above) that the REAL bsd:u service has never heard of --
@@ -1255,14 +1417,39 @@ namespace ams::mitm::bsd {
             forward_nfds++;
         }
 
+        // If any polled fd (real or virtual/synthetic) already has relay
+        // data waiting, don't block the forwarded real poll for the
+        // caller's full timeout -- the real socket never sees relay
+        // traffic, so a real poll() with e.g. a multi-second timeout would
+        // sit there for its entire duration even though we already know
+        // what to report, delaying delivery of already-ready data by up to
+        // that whole timeout. Confirmed live: repeated multi-second
+        // "Poll injected POLLIN" gaps (3.1s/4.8s/1.8s, stacking to ~10s)
+        // right as ldn_mitm re-polled after a lobby exit, matching a
+        // reported UI pause backing out of a lobby.
+        bool any_pending = false;
+        for (s32 i = 0; i < nfds && !any_pending; i++) {
+            any_pending = VFdHasPendingRead(pfds_in[i].fd);
+        }
+
         s32 count = 0;
         if (forward_nfds > 0) {
-            struct { s32 nfds, timeout; } in = { forward_nfds, timeout };
+            struct { s32 nfds, timeout; } in = { forward_nfds, any_pending ? 0 : timeout };
             RetErrno out{};
+            u64 dispatch_start_ms = NowMs();
             serviceMitmDispatchInOut(m_forward_service.get(), 6, in, out,
                 .buffer_attrs = { SfBufferAttr_In | SfBufferAttr_HipcAutoSelect, SfBufferAttr_Out | SfBufferAttr_HipcAutoSelect },
                 .buffers = { { forward_in, sizeof(struct pollfd) * static_cast<size_t>(forward_nfds) },
                             { forward_out, sizeof(struct pollfd) * static_cast<size_t>(forward_nfds) } });
+            u64 dispatch_ms = NowMs() - dispatch_start_ms;
+            if (dispatch_ms > 500) {
+                // The real forwarded poll() took far longer than the
+                // any_pending-adjusted timeout we asked for -- points at
+                // the real underlying bsd:u/network stack itself being
+                // slow, not our own forwarding logic.
+                LogFormat("BsdBridge: Poll real forward took %llums (asked timeout=%d, any_pending=%d, forward_nfds=%d)",
+                    static_cast<unsigned long long>(dispatch_ms), in.timeout, any_pending ? 1 : 0, forward_nfds);
+            }
             out_errno.SetValue(out.err);
             if (out.ret > 0) {
                 for (s32 j = 0; j < forward_nfds; j++) {
@@ -1562,6 +1749,8 @@ namespace ams::mitm::bsd {
         ssize_t sent = GetRelay().SendIpv4(packet, total);
         LogFormat("BsdBridge: SendTo(bridged fd=%d, %zu bytes -> dst 0x%08x:%u) relay_sent=%zd",
             fd, payload_len, dst_ip, dst_port, sent);
+        LogNonControlUdpPayload("send", m_bridged_local_port,
+            static_cast<const u8 *>(buffer.GetPointer()), payload_len);
         TouchBridgeActivity();
 
         out_errno.SetValue(sent >= 0 ? 0 : EIO);
@@ -1578,7 +1767,7 @@ namespace ams::mitm::bsd {
             std::scoped_lock lk(g_vtcp_mutex);
             VTcpConn *c = FindVTcpConnByFd(fd);
             if (c != nullptr) {
-                if (!c->inbox_ready) {
+                if (c->inbox_len == 0) {
                     if (c->peer_closed) {
                         LogFormat("BsdBridge: RecvFrom(tcp fd=%d) -- delivering EOF (peer_closed) to ldn_mitm", fd);
                     }
@@ -1590,11 +1779,16 @@ namespace ams::mitm::bsd {
                 size_t deliver = c->inbox_len;
                 if (deliver > buffer.GetSize()) deliver = buffer.GetSize();
                 std::memcpy(buffer.GetPointer(), c->inbox, deliver);
-                // Each queued entry is one complete LAN packet (a plain UDP
-                // datagram in both TCP-tunnel modes now), so a full clear is
-                // correct in both -- no message-boundary/stream concerns.
-                c->inbox_ready = false;
-                c->inbox_len = 0;
+                // Keep whatever didn't fit. ldn_mitm asks for only
+                // sizeof(buffer) - recvSize bytes while it holds a partial
+                // packet (LanSocket::recvPartPacket), which happens as soon as
+                // the peer's own stack coalesces two LAN packets into one
+                // segment -- so a short read here is normal, and dropping the
+                // tail would silently desync its stream rather than error.
+                c->inbox_len -= deliver;
+                if (c->inbox_len > 0) {
+                    std::memmove(c->inbox, c->inbox + deliver, c->inbox_len);
+                }
 
                 struct sockaddr_in src_sin{};
                 src_sin.sin_family = AF_INET;
@@ -1669,6 +1863,8 @@ namespace ams::mitm::bsd {
 
         LogFormat("BsdBridge: RecvFrom(bridged fd=%d) delivered %zu bytes from relay (src 0x%08x:%u)",
             fd, payload_len, src_ip, src_port);
+        LogNonControlUdpPayload("recv", m_bridged_local_port,
+            static_cast<const u8 *>(buffer.GetPointer()), payload_len);
         TouchBridgeActivity();
 
         out_ret.SetValue(static_cast<s32>(payload_len));

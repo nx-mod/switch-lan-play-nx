@@ -85,9 +85,18 @@ namespace ams::mitm::bsd {
         u32 our_isn = 0;   // recorded at SYN time (client role) to validate the SYN-ACK's ack field
         u32 our_seq = 0;   // next byte WE will send
         u32 their_seq = 0; // next byte WE expect (the value we put in our own ack field)
+        // Received bytes not yet handed to ldn_mitm. This is a TCP byte
+        // STREAM, not a queue of messages: segments append, and a short
+        // recv consumes only part of it. ldn_mitm reassembles LAN packets
+        // itself (LanSocket::recvPartPacket) and deliberately reads with a
+        // shrinking buffer -- sizeof(buffer) - recvSize -- whenever it has a
+        // partial packet pending, so treating an entry as one whole message
+        // and discarding whatever didn't fit desynchronizes its stream. It
+        // does not report that: on a bad magic it just calls resetRecvSize()
+        // and returns 0, so the connection stays up and the session silently
+        // stalls until the game's own timeout gives up.
         u8 inbox[VTcpInboxCap];
         size_t inbox_len = 0;
-        bool inbox_ready = false;
         bool peer_closed = false;
 
         // Retransmission for the one outbound data segment SendTo() may
@@ -98,8 +107,8 @@ namespace ams::mitm::bsd {
         // ldn_mitm just timed out and tore the session down
         // ("communication error"). Only ONE segment can be in flight at a
         // time here, matching ldn_mitm's own send-then-wait-for-reply usage
-        // pattern for this socket (same assumption the single-slot inbox
-        // above already relies on).
+        // pattern for this socket. (The receive side makes no such
+        // assumption -- see the inbox comment above.)
         bool has_unacked_data = false;
         u8 unacked_data[VTcpInboxCap];
         size_t unacked_data_len = 0;
