@@ -9,6 +9,7 @@ import os, sys, time, argparse
 # slp_ldn.py lives one level up, in switch-lan-play-nx/tools -- keep this
 # relative so the probe stays self-contained inside this repo.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import slp_ldn  # noqa: E402
 from slp_ldn import LdnNode, network_id_of  # noqa: E402
 
 
@@ -27,6 +28,10 @@ def main():
 
     my_ip = bytes(int(x) for x in a.ip.split("."))
     node = LdnNode(my_ip, "PC-SCAN", (a.relay, a.port))
+    # __init__ leaves state at STATE_NONE -- fake_ldn_host.py/fake_ldn_join.py
+    # both do this same thing right after construction. There is no separate
+    # "initialize" call in LdnNode; this stands in for it.
+    node.state = slp_ldn.STATE_INITIALIZED
     print("PC node {} -> relay {}:{}".format(ip_str(my_ip), a.relay, a.port))
 
     try:
@@ -40,9 +45,10 @@ def main():
                 print("  [{}] ssid={!r} nodes={} lcid=0x{:016X}".format(
                     i, ssid, info.get("node_count"), network_id_of(info)))
                 for n in info.get("nodes", [])[: info.get("node_count", 0)]:
+                    ip = n.get("ip")
                     print("       node{} {} ip={} connected={}".format(
-                        n.get("node_id"), repr(n.get("user_name")),
-                        ip_str(n["ipv4"]) if isinstance(n.get("ipv4"), (bytes, bytearray)) else n.get("ipv4"),
+                        n.get("node_id"), repr(n.get("name")),
+                        ip_str(ip) if isinstance(ip, (bytes, bytearray)) else ip,
                         n.get("is_connected")))
             if not results:
                 print("  (nothing seen)")
