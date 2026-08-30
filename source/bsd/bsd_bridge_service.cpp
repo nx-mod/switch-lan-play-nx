@@ -435,6 +435,28 @@ namespace ams::mitm::bsd {
             return true;
         }
 
+        // Standard IPv4 header checksum: 16-bit one's-complement sum over the
+        // 20-byte header alone (no options ever emitted here), with the
+        // header's own checksum field taken as zero for the purpose of this
+        // calculation. Every peer that has ever exercised this code before
+        // was itself a raw relay-byte consumer with no real kernel IP stack
+        // in the path (another switch-lan-play-nx instance, or a PC-side
+        // test script), so a permanently-zero checksum here was invisible --
+        // a real OS (Eden's Android kernel, receiving relayed packets via
+        // its VpnService TUN interface) unconditionally verifies this at
+        // ip_rcv and silently drops anything that fails, before the packet
+        // ever reaches a socket. That's indistinguishable from the peer
+        // simply never replying, which is exactly what was observed.
+        u16 IpChecksum(const u8 *header) {
+            u32 sum = 0;
+            for (size_t i = 0; i < 20; i += 2) {
+                if (i == 10) continue; // checksum field itself reads as zero
+                sum += (static_cast<u32>(header[i]) << 8) | header[i + 1];
+            }
+            while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+            return static_cast<u16>(~sum);
+        }
+
         // Standard TCP checksum: 16-bit one's-complement sum over the pseudo
         // header (src ip, dst ip, zero, protocol, tcp length) followed by the
         // full segment (header + payload), with the segment's own checksum
@@ -541,11 +563,14 @@ namespace ams::mitm::bsd {
             ip[0] = 0x45; ip[1] = 0x00;
             ip[2] = static_cast<u8>(total >> 8); ip[3] = static_cast<u8>(total);
             ip[4] = 0; ip[5] = 0; ip[6] = 0; ip[7] = 0;
-            ip[8] = 64; ip[9] = 6; ip[10] = 0; ip[11] = 0; // protocol = TCP
+            ip[8] = 64; ip[9] = 6; ip[10] = 0; ip[11] = 0; // protocol = TCP, checksum filled below
             ip[12] = static_cast<u8>(src_ip >> 24); ip[13] = static_cast<u8>(src_ip >> 16);
             ip[14] = static_cast<u8>(src_ip >> 8);  ip[15] = static_cast<u8>(src_ip);
             ip[16] = static_cast<u8>(dst_ip >> 24); ip[17] = static_cast<u8>(dst_ip >> 16);
             ip[18] = static_cast<u8>(dst_ip >> 8);  ip[19] = static_cast<u8>(dst_ip);
+            u16 ip_csum = IpChecksum(ip);
+            ip[10] = static_cast<u8>(ip_csum >> 8);
+            ip[11] = static_cast<u8>(ip_csum);
 
             u8 *tcp = packet + 20;
             tcp[0] = static_cast<u8>(src_port >> 8); tcp[1] = static_cast<u8>(src_port);
@@ -1727,11 +1752,14 @@ namespace ams::mitm::bsd {
         ip[0] = 0x45; ip[1] = 0x00;
         ip[2] = static_cast<u8>(total >> 8); ip[3] = static_cast<u8>(total);
         ip[4] = 0; ip[5] = 0; ip[6] = 0; ip[7] = 0;
-        ip[8] = 64; ip[9] = 17; ip[10] = 0; ip[11] = 0;
+        ip[8] = 64; ip[9] = 17; ip[10] = 0; ip[11] = 0; // protocol = UDP, checksum filled below
         ip[12] = static_cast<u8>(m_bridged_local_ip >> 24); ip[13] = static_cast<u8>(m_bridged_local_ip >> 16);
         ip[14] = static_cast<u8>(m_bridged_local_ip >> 8);  ip[15] = static_cast<u8>(m_bridged_local_ip);
         ip[16] = static_cast<u8>(dst_ip >> 24); ip[17] = static_cast<u8>(dst_ip >> 16);
         ip[18] = static_cast<u8>(dst_ip >> 8);  ip[19] = static_cast<u8>(dst_ip);
+        u16 ip_csum = IpChecksum(ip);
+        ip[10] = static_cast<u8>(ip_csum >> 8);
+        ip[11] = static_cast<u8>(ip_csum);
 
         u8 *udp = packet + 20;
         u16 udp_len = static_cast<u16>(8 + payload_len);
