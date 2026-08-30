@@ -1,0 +1,9 @@
+build/
+*.elf
+*.nso
+*.nacp
+*.pfs0
+__pycache__/
+
+# the built NRO is tracked on purpose -- it is the artifact you copy to the SD card
+!*.nro
